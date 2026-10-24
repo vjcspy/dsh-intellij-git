@@ -21,6 +21,7 @@ const PHASE_KEYS: Record<BusyKind, DshIntellijGitKey> = {
   merge: 'phase.merge',
   rollback: 'phase.rollback',
   revertHunk: 'phase.revertHunk',
+  switchBranch: 'phase.switchBranch',
 }
 
 /** The phase text of a running write, and the same text with elapsed seconds once it is slow. */

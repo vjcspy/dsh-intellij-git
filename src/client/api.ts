@@ -9,6 +9,7 @@ import type {
   ActivityClearResponse,
   ActivityListResponse,
   ApiErrorBody,
+  BranchesResponse,
   CommitRequest,
   CommitResponse,
   FileDiffResponse,
@@ -17,6 +18,8 @@ import type {
   RepoStatusResponse,
   RollbackRequest,
   RollbackResponse,
+  SwitchRequest,
+  SwitchResponse,
   SyncRequest,
   SyncResponse,
   WatchResponse,
@@ -146,6 +149,10 @@ export function createApi(options: ApiOptions = {}) {
     watch: (body: { repoId: string }): Promise<WatchResponse> => post<WatchResponse>('watch', body),
     /** Push, or integrate the push target and push. */
     sync: (body: SyncRequest): Promise<SyncResponse> => post<SyncResponse>('sync', body),
+    /** Local and remote-tracking branches of one repository, with their facts. */
+    branches: (repoId: string): Promise<BranchesResponse> => post<BranchesResponse>('branches', { repoId }),
+    /** Switch to, reuse or create one branch. Runs exactly one `git switch`. */
+    switchBranch: (body: SwitchRequest): Promise<SwitchResponse> => post<SwitchResponse>('switchBranch', body),
     /** The host-side activity buffer: everything, or only entries newer than `after`. */
     activity: (after?: number): Promise<ActivityListResponse> =>
       call<ActivityListResponse>('activity', { method: 'GET' }, after === undefined ? {} : { query: `after=${after}` }),

@@ -63,7 +63,7 @@ export const INTEGRATE_TIMEOUT_MS = 120_000
 /** One route this plugin registers. */
 export interface RouteSpec {
   /** Route key used by the browser half. */
-  readonly key: 'tree' | 'status' | 'diff' | 'rollback' | 'commit' | 'generateMessage' | 'watch' | 'sync' | 'activity' | 'activityClear'
+  readonly key: 'tree' | 'status' | 'diff' | 'rollback' | 'commit' | 'generateMessage' | 'watch' | 'sync' | 'branches' | 'switchBranch' | 'activity' | 'activityClear'
   /** Path below the API prefix. */
   readonly path: string
   /** The one HTTP method the handler serves; the other channel verb answers 405. */
@@ -85,6 +85,8 @@ export const ROUTES: readonly RouteSpec[] = [
   { key: 'generateMessage', path: `${API_PREFIX}/repo/generate-message`, method: 'POST' },
   { key: 'watch', path: `${API_PREFIX}/repo/watch`, method: 'POST', silent: true },
   { key: 'sync', path: `${API_PREFIX}/repo/sync`, method: 'POST' },
+  { key: 'branches', path: `${API_PREFIX}/repo/branches`, method: 'POST' },
+  { key: 'switchBranch', path: `${API_PREFIX}/repo/switch`, method: 'POST' },
   { key: 'activity', path: `${API_PREFIX}/activity`, method: 'GET', silent: true },
   { key: 'activityClear', path: `${API_PREFIX}/activity/clear`, method: 'POST', silent: true },
 ]
@@ -139,7 +141,16 @@ export interface FileChangeEntry {
 /** Answer of `repo/status`. */
 export interface RepoStatusResponse {
   readonly repoId: string
+  /**
+   * `branch.head` exactly as porcelain reports it, including the literal
+   * `(detached)` sentinel; render it through `branchLabelOf`, never raw.
+   */
   readonly branch: string
+  /**
+   * True when `HEAD` is not on a branch. Derived from porcelain's own
+   * `(detached)` sentinel, so it costs no extra process.
+   */
+  readonly detached: boolean
   /** Current `HEAD` OID, or null on an unborn branch. */
   readonly headOid: string | null
   /** Abbreviated `HEAD`, or `initial` on an unborn branch. */
@@ -225,6 +236,12 @@ export interface CommitRequest {
   readonly repoId: string
   /** The `HEAD` the browser's view was built from; the Host refuses a moved `HEAD`. */
   readonly expectedHeadOid: string | null
+  /**
+   * The branch the view was built from. Omitted by a caller that only knows the
+   * OID (a raw probe), which keeps the OID-only compare-and-swap; the browser
+   * always sends it, `null` on a detached `HEAD`.
+   */
+  readonly expectedBranch?: string | null
   readonly message: string
   readonly amend: boolean
   readonly files: readonly FileInclusionRequest[]
@@ -247,6 +264,12 @@ export interface CommitResponse {
   readonly indexSyncError?: string
   /** True when `HEAD` was not the expected commit after the commit ran. */
   readonly headMovedDuringCommit: boolean
+  /**
+   * True when a branch was checked and no longer matches after the commit:
+   * a terminal switch landed between the compare-and-swap and `git commit`.
+   * Reported, never prevented; git has no atomic symref swap.
+   */
+  readonly branchMovedDuringCommit: boolean
   readonly pushed: boolean
   readonly pushTarget?: string
   readonly pushErrorCode?: PushErrorCode
@@ -281,6 +304,8 @@ export interface SyncRequest {
   readonly repoId: string
   /** The `HEAD` the browser's view was built from; the Host refuses a moved `HEAD`. */
   readonly expectedHeadOid: string | null
+  /** The branch the view was built from; omitted keeps the OID-only check. */
+  readonly expectedBranch?: string | null
   readonly mode: SyncMode
 }
 
@@ -343,10 +368,86 @@ export interface ActivityClearResponse {
   readonly latestId: number
 }
 
+/**
+ * One row of the branch listing.
+ *
+ * `name` is the display name, always `%(refname:lstrip=2)` of the fully-qualified
+ * ref: a short name is ambiguity-dependent (a branch and a tag sharing a name
+ * shorten to `heads/<name>`), so it is never used for identity.
+ */
+export interface BranchEntry {
+  readonly kind: 'local' | 'remote'
+  /** Display name: `feature` for a local ref, `origin/feature` for a remote one. */
+  readonly name: string
+  /** Local branch name a remote row would create or reuse; null for a local row. */
+  readonly localName: string | null
+  /** Display form of the full `%(upstream)` ref, or null when the branch tracks nothing. */
+  readonly upstream: string | null
+  readonly headShortSha: string | null
+  readonly subject: string
+  /** Committer date, epoch seconds. */
+  readonly committedAt: number
+  /** Real path of the other worktree holding this branch, or null. */
+  readonly checkedOutAt: string | null
+  readonly current: boolean
+  /** Same-named local that does not track this remote ref; the row is refused with `BRANCH_EXISTS`. */
+  readonly localConflict: { readonly name: string; readonly upstream: string | null } | null
+}
+
+/** Answer of `repo/branches`. */
+export interface BranchesResponse {
+  readonly repoId: string
+  /** Current branch display name, or null on a detached `HEAD`. */
+  readonly current: string | null
+  readonly detached: boolean
+  /** Abbreviated `HEAD`, or null on an unborn branch. */
+  readonly headShortSha: string | null
+  /** Configured remote names, longest-prefix matching is done host-side. */
+  readonly remotes: readonly string[]
+  readonly local: readonly BranchEntry[]
+  readonly remote: readonly BranchEntry[]
+}
+
+/**
+ * What `repo/switch` should end up checked out.
+ *
+ * `name` is always a display name from the listing: the bare branch name for
+ * `local` and `new`, `<remote>/<branch>` for `remote`.
+ */
+export type SwitchTarget =
+  | { readonly kind: 'local', readonly name: string }
+  | { readonly kind: 'remote', readonly name: string }
+  | { readonly kind: 'new', readonly name: string }
+
+/** Body of `repo/switch`. */
+export interface SwitchRequest {
+  readonly repoId: string
+  readonly target: SwitchTarget
+  /** The `HEAD` the listing was built from; the Host refuses a moved `HEAD`. */
+  readonly expectedHeadOid: string | null
+  /** The branch the listing was built from; omitted keeps the OID-only check. */
+  readonly expectedBranch?: string | null
+}
+
+/** Answer of `repo/switch`. */
+export interface SwitchResponse {
+  readonly repoId: string
+  readonly previousBranch: string | null
+  readonly branch: string | null
+  readonly headOid: string | null
+  readonly headShortSha: string | null
+  /** True when a local tracking branch was created. */
+  readonly created: boolean
+  /** False only when the target branch was already current. */
+  readonly changed: boolean
+}
+
 /** Body of `repo/rollback`. */
 export interface RollbackRequest {
   readonly repoId: string
   readonly expectedHeadOid: string | null
+  /** The branch the view was built from; omitted keeps the OID-only check. */
+  readonly expectedBranch?: string | null
   readonly files: readonly FileInclusionRequest[]
   /** Required to delete an untracked path from disk, or a path absent from `HEAD`. */
   readonly confirmDeletePaths: boolean

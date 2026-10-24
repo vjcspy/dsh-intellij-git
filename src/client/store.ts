@@ -21,12 +21,15 @@ import {
   ROOT_REPO_ID,
   WATCH_INTERVAL_MS,
   type ActivityEntry,
+  type BranchesResponse,
   type CommitResponse,
   type FileChangeEntry,
   type FileDiffResponse,
   type FileInclusion,
   type GenerateMessageResponse,
   type RepoStatusResponse,
+  type SwitchResponse,
+  type SwitchTarget,
   type SyncMode,
   type SyncResponse,
   type WorkspaceTreeResponse,
@@ -69,7 +72,7 @@ export type PendingAction =
   | { readonly kind: 'push', readonly origin: 'commit' }
 
 /** Which write is running. */
-export type BusyKind = 'commit' | 'commitPush' | 'push' | 'rebase' | 'merge' | 'rollback' | 'revertHunk'
+export type BusyKind = 'commit' | 'commitPush' | 'push' | 'rebase' | 'merge' | 'rollback' | 'revertHunk' | 'switchBranch'
 
 /** The write that owns the page's locks. Only its own completion releases it. */
 export interface BusyState {
@@ -88,6 +91,46 @@ export interface SyncOffer {
   /** Resolved push target the integration would run against. */
   readonly target: string
   readonly branch: string
+}
+
+/** One branch-write failure as the dialog renders it. */
+export interface BranchFailure {
+  readonly code: string
+  readonly message: string
+  readonly details: Readonly<Record<string, unknown>>
+}
+
+/** The branch dialog's own state; nothing here outlives the dialog on purpose. */
+export interface BranchDialogState {
+  readonly open: boolean
+  readonly listing: BranchesResponse | null
+  readonly loading: boolean
+  /** Listing failure, rendered inline in the dialog; never a banner. */
+  readonly error: string | null
+  readonly filter: string
+  readonly selected: SwitchTarget | null
+  readonly mode: 'list' | 'create'
+  readonly newName: string
+  readonly submitting: boolean
+  /** Switch failure, rendered inline under the filter. */
+  readonly submitError: BranchFailure | null
+  /** Monotonic token; a listing that resolves after a newer one is dropped. */
+  readonly requestSeq: number
+}
+
+/** What the dialog holds when it is closed. */
+const CLOSED_BRANCH_DIALOG: BranchDialogState = {
+  open: false,
+  listing: null,
+  loading: false,
+  error: null,
+  filter: '',
+  selected: null,
+  mode: 'list',
+  newName: '',
+  submitting: false,
+  submitError: null,
+  requestSeq: 0,
 }
 
 /** Everything the page renders from. */
@@ -157,6 +200,8 @@ export interface IntellijGitState {
   readonly activityError: string | null
   /** Non-null while a rejected push is waiting for the Human to choose an order. */
   readonly syncOffer: SyncOffer | null
+  /** The branch dialog: one confirmation surface for one branch write. */
+  readonly branchDialog: BranchDialogState
 }
 
 /** Everything the store can do. */
@@ -216,6 +261,19 @@ export interface IntellijGitActions {
   sync(mode: SyncMode): Promise<void>
   /** Dismiss the push offer without integrating. */
   dismissSyncOffer(): void
+  /** Open the branch dialog and load the listing; a no-op while a write owns the lock. */
+  openBranchDialog(): void
+  /** Reload the listing, keeping the filter and clearing a selection that vanished. */
+  reloadBranches(): Promise<void>
+  setBranchFilter(value: string): void
+  selectBranchTarget(target: SwitchTarget): void
+  /** Switch the dialog into New-branch mode, based on the current `HEAD`. */
+  showCreateBranch(): void
+  setNewBranchName(value: string): void
+  /** Close the dialog; refused while a switch is running. */
+  closeBranchDialog(): void
+  /** Run the one branch write the dialog confirms. */
+  submitSwitch(): Promise<void>
   /** Request a full snapshot read of the host buffer (the dock's Refresh button). */
   refreshActivity(): Promise<void>
   clearActivity(): Promise<void>
@@ -307,6 +365,7 @@ export function createIntellijGitStore(): IntellijGitStore {
     activityStale: false,
     activityError: null,
     syncOffer: null,
+    branchDialog: CLOSED_BRANCH_DIALOG,
   }
   const listeners = new Set<() => void>()
 
@@ -724,7 +783,12 @@ export function createIntellijGitStore(): IntellijGitStore {
    */
   const syncLeg = async (repoId: string, mode: SyncMode, status: RepoStatusResponse): Promise<Partial<IntellijGitState>> => {
     try {
-      const response: SyncResponse = await api.sync({ repoId, expectedHeadOid: status.headOid, mode })
+      const response: SyncResponse = await api.sync({
+        repoId,
+        expectedHeadOid: status.headOid,
+        expectedBranch: status.detached ? null : status.branch,
+        mode,
+      })
       await refreshStatus()
       const branch = state.status?.branch ?? status.branch
       if (response.pushErrorCode === 'PUSH_REJECTED') {
@@ -778,6 +842,107 @@ export function createIntellijGitStore(): IntellijGitStore {
     } finally {
       finishOp(opId, patch)
     }
+  }
+
+  // --------------------------------------------------------------- branches
+
+  /**
+   * Describe a thrown branch failure for the dialog.
+   * @param error - the failure.
+   * @returns the code, message and details the dialog maps to one sentence.
+   */
+  const branchFailure = (error: unknown): BranchFailure => {
+    if (error instanceof ApiError) return { code: error.code, message: error.message, details: error.details ?? {} }
+    return {
+      code: 'INTERNAL',
+      message: error instanceof Error ? error.message : String(error),
+      details: {},
+    }
+  }
+
+  /**
+   * The state the dialog holds after closing it, with any in-flight listing invalidated.
+   * @returns the closed slice.
+   */
+  const closedBranchDialog = (): BranchDialogState => ({
+    ...CLOSED_BRANCH_DIALOG,
+    requestSeq: state.branchDialog.requestSeq + 1,
+  })
+
+  /**
+   * Load the branch listing of the active repository.
+   *
+   * Sequenced like every other read here: the token and the repository are
+   * captured before the call and re-checked after it, so a slow answer can
+   * neither repaint another repository's branches nor reinstate a selection that
+   * a reload proved gone.
+   * @param reset - clear the filter-mode state as well (a fresh open).
+   */
+  const loadBranches = async (reset: boolean): Promise<void> => {
+    const repoId = state.activeRepoId
+    if (repoId === null) return
+    const requestSeq = state.branchDialog.requestSeq + 1
+    set({
+      branchDialog: {
+        ...state.branchDialog,
+        loading: true,
+        error: null,
+        requestSeq,
+        ...(reset ? { selected: null, submitError: null, mode: 'list' as const, newName: '' } : {}),
+      },
+    })
+    try {
+      const listing = await api.branches(repoId)
+      if (requestSeq !== state.branchDialog.requestSeq || state.activeRepoId !== repoId) return
+      const selected = state.branchDialog.selected
+      const stillListed = selected !== null
+        && (listing.local.some(row => row.name === selected.name) || listing.remote.some(row => row.name === selected.name))
+      set({
+        branchDialog: {
+          ...state.branchDialog,
+          listing,
+          loading: false,
+          error: null,
+          selected: stillListed ? selected : null,
+        },
+      })
+    } catch (error) {
+      if (requestSeq !== state.branchDialog.requestSeq || state.activeRepoId !== repoId) return
+      set({
+        branchDialog: {
+          ...state.branchDialog,
+          loading: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      })
+    }
+  }
+
+  /**
+   * Drop every piece of view state that belongs to the branch that was checked out.
+   *
+   * A switch makes all of it wrong at once: the inclusion map reseeds the previous
+   * branch's partial and `none` values onto same-named paths, the draft describes
+   * the old diff, and the diff, selection and push offer belong to a tree that is
+   * no longer checked out. Layout preferences and the activity dock survive.
+   * @param repoId - the repository that switched.
+   */
+  const resetBranchScopedView = (repoId: string): void => {
+    diffRequestSeq += 1
+    draftGeneration += 1
+    set({
+      inclusions: { ...state.inclusions, [repoId]: {} },
+      message: '',
+      amend: false,
+      aiError: null,
+      aiRoute: null,
+      syncOffer: null,
+      selected: null,
+      diff: null,
+      diffError: null,
+      diffLoading: false,
+      statusDigest: null,
+    })
   }
 
   // ----------------------------------------------------------------- watcher
@@ -1088,6 +1253,84 @@ export function createIntellijGitStore(): IntellijGitStore {
       set({ syncOffer: null })
     },
 
+    openBranchDialog() {
+      if (state.activeRepoId === null || state.busy !== null) return
+      set({ branchDialog: { ...closedBranchDialog(), open: true } })
+      void loadBranches(true)
+    },
+
+    async reloadBranches() {
+      if (state.branchDialog.submitting) return
+      await loadBranches(false)
+    },
+
+    setBranchFilter(value) {
+      set({ branchDialog: { ...state.branchDialog, filter: value } })
+    },
+
+    selectBranchTarget(target) {
+      if (state.branchDialog.submitting) return
+      set({ branchDialog: { ...state.branchDialog, selected: target, mode: 'list', submitError: null } })
+    },
+
+    showCreateBranch() {
+      if (state.branchDialog.submitting) return
+      set({ branchDialog: { ...state.branchDialog, mode: 'create', selected: null, newName: '', submitError: null } })
+    },
+
+    setNewBranchName(value) {
+      if (state.branchDialog.submitting) return
+      set({ branchDialog: { ...state.branchDialog, newName: value } })
+    },
+
+    closeBranchDialog() {
+      if (state.branchDialog.submitting) return
+      set({ branchDialog: closedBranchDialog() })
+    },
+
+    async submitSwitch() {
+      const repoId = state.activeRepoId
+      const dialog = state.branchDialog
+      const status = state.status
+      if (repoId === null || status === null || state.busy !== null || dialog.submitting) return
+      const newName = dialog.newName.trim()
+      const target: SwitchTarget | null = dialog.mode === 'create'
+        ? (newName === '' ? null : { kind: 'new', name: newName })
+        : dialog.selected
+      if (target === null) return
+      const opId = beginOp('switchBranch', repoId)
+      set({ branchDialog: { ...state.branchDialog, submitting: true, submitError: null } })
+      let patch: Partial<IntellijGitState> = {}
+      try {
+        const response: SwitchResponse = await api.switchBranch({
+          repoId,
+          target,
+          expectedHeadOid: status.headOid,
+          expectedBranch: status.detached ? null : status.branch,
+        })
+        set({ branchDialog: closedBranchDialog() })
+        resetBranchScopedView(repoId)
+        await refreshStatus()
+        patch = {
+          toast: {
+            key: 'branch.done',
+            params: { branch: response.branch ?? target.name },
+            at: Date.now(),
+          },
+        }
+      } catch (error) {
+        set({ branchDialog: { ...state.branchDialog, submitting: false, submitError: branchFailure(error) } })
+        if (error instanceof ApiError && error.code === 'HEAD_MOVED') {
+          // The compare-and-swap seed and the dialog's own current marker are both
+          // stale now, so refresh the status and reload the rows; never retry.
+          await refreshStatus()
+          await loadBranches(false)
+        }
+      } finally {
+        finishOp(opId, patch)
+      }
+    },
+
     async refreshActivity() {
       await scheduleActivityRefresh({ full: true })
     },
@@ -1198,6 +1441,7 @@ export function createIntellijGitStore(): IntellijGitStore {
           const response: CommitResponse = await api.commit({
             repoId,
             expectedHeadOid: status.headOid,
+            expectedBranch: status.detached ? null : status.branch,
             message: state.message,
             amend: state.amend,
             files,
@@ -1218,6 +1462,8 @@ export function createIntellijGitStore(): IntellijGitStore {
           const sha = (response.commitSha ?? '').slice(0, 7)
           if (response.headMovedDuringCommit) {
             patch = { banner: { kind: 'error', key: 'commit.headMoved' } }
+          } else if (response.branchMovedDuringCommit) {
+            patch = { banner: { kind: 'error', key: 'commit.branchMoved' } }
           } else if (!response.indexSynced) {
             patch = { banner: { kind: 'error', key: 'commit.indexWarning', params: { reason: response.indexSyncError ?? '' } } }
           } else {
@@ -1253,7 +1499,13 @@ export function createIntellijGitStore(): IntellijGitStore {
       let patch: Partial<IntellijGitState> = {}
       try {
         if (isRollback) {
-          const response = await api.rollback({ repoId, expectedHeadOid: status.headOid, files, confirmDeletePaths: true })
+          const response = await api.rollback({
+            repoId,
+            expectedHeadOid: status.headOid,
+            expectedBranch: status.detached ? null : status.branch,
+            files,
+            confirmDeletePaths: true,
+          })
           diffRequestSeq += 1
           await refreshStatus()
           patch = {
@@ -1268,6 +1520,7 @@ export function createIntellijGitStore(): IntellijGitStore {
             await api.rollback({
               repoId,
               expectedHeadOid: status.headOid,
+              expectedBranch: status.detached ? null : status.branch,
               confirmDeletePaths: true,
               files: [{
                 path: selected.path,

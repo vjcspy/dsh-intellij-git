@@ -26,6 +26,7 @@ import {
 
 import { ROOT_REPO_ID, type FileChangeEntry } from '../config.ts'
 import { ActionButton } from './ActionButton.tsx'
+import { branchLabelOf } from './branch-label.ts'
 import type { DshIntellijGitKey, Translate } from './locale.ts'
 import { usePhase } from './phase.ts'
 import { groupsOf, selectedInclusions, type IntellijGitStore } from './store.ts'
@@ -239,9 +240,15 @@ export function CommitPanel(props: CommitPanelProps): ReactNode {
         <FileTypeIcon kind="folder" size={14} />
         <span className={active ? 'git-label git-repo' : 'git-label'}>{label}</span>
         {active && status !== null ? (
-          <Tooltip label={t('repo.branch.tip', { branch: status.branch, ahead: status.ahead, behind: status.behind })} delayMs={500} portal>
+          <Tooltip
+            label={status.detached
+              ? t('branch.badge.detached.tip', { sha: status.headShortSha })
+              : t('repo.branch.tip', { branch: status.branch, ahead: status.ahead, behind: status.behind })}
+            delayMs={500}
+            portal
+          >
             <span className="git-branch git-mono">
-              <span>{status.branch}</span>
+              <span>{branchLabelOf(status, t)}</span>
               {status.ahead > 0 ? <span className="git-ahead">{`↑${status.ahead}`}</span> : null}
               {status.behind > 0 ? <span className="git-behind">{`↓${status.behind}`}</span> : null}
             </span>

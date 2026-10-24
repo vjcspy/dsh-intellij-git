@@ -23,6 +23,8 @@ import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import { ROOT_REPO_ID } from '../config.ts'
 import { ActionButton } from './ActionButton.tsx'
 import { ActivityDock } from './ActivityDock.tsx'
+import { branchLabelOf } from './branch-label.ts'
+import { BranchDialog } from './BranchDialog.tsx'
 import { CommitPanel } from './CommitPanel.tsx'
 import { ConfirmDialog } from './ConfirmDialog.tsx'
 import { DiffPanel } from './DiffPanel.tsx'
@@ -120,7 +122,8 @@ export function GitPage(props: GitPageProps): ReactNode {
   }
 
   const status = state.status
-  const working = state.busy !== null || state.statusLoading || state.diffLoading || state.treeLoading
+  const busy = state.busy !== null
+  const working = busy || state.statusLoading || state.diffLoading || state.treeLoading
   const label = repoLabelOf(state)
   const banner = state.banner
 
@@ -131,11 +134,29 @@ export function GitPage(props: GitPageProps): ReactNode {
           <span className="git-title">{t('page.title')}</span>
           {label === '' ? null : <span className="git-repoName git-mono">{label}</span>}
           {status === null ? null : (
-            <Tooltip label={t('repo.branch.tip', { branch: status.branch, ahead: status.ahead, behind: status.behind })} delayMs={500} portal side="bottom">
-              <span className="git-branchTag">
-                <Tag tone="info">{status.branch}</Tag>
-                {status.ahead > 0 ? <Tag tone="success">{`↑${status.ahead}`}</Tag> : null}
-                {status.behind > 0 ? <Tag tone="warning">{`↓${status.behind}`}</Tag> : null}
+            <Tooltip
+              label={busy
+                ? t('busy.wait', { phase: phase?.text ?? '' })
+                : status.detached
+                  ? t('branch.badge.detached.tip', { sha: status.headShortSha })
+                  : t('branch.badge.tip', { branch: status.branch })}
+              delayMs={500}
+              portal
+              side="bottom"
+            >
+              <span className={busy ? 'git-branchTag git-tipAnchor' : 'git-branchTag'}>
+                <button
+                  type="button"
+                  className="git-branchBtn"
+                  aria-haspopup="dialog"
+                  aria-label={t('branch.badge.aria')}
+                  disabled={busy || state.activeRepoId === null}
+                  onClick={() => { store.actions.openBranchDialog() }}
+                >
+                  <span className="git-branchBtnName git-mono">{branchLabelOf(status, t)}</span>
+                  {status.ahead > 0 ? <Tag tone="success">{`↑${status.ahead}`}</Tag> : null}
+                  {status.behind > 0 ? <Tag tone="warning">{`↓${status.behind}`}</Tag> : null}
+                </button>
               </span>
             </Tooltip>
           )}
@@ -214,6 +235,7 @@ export function GitPage(props: GitPageProps): ReactNode {
       <ConfirmDialog store={store} origin="commit" t={t} />
       <ConfirmDialog store={store} origin="diff" t={t} />
       <IntegrateDialog store={store} t={t} />
+      <BranchDialog store={store} t={t} />
 
       {state.toast === null ? null : (
         <Toast

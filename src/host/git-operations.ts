@@ -75,20 +75,64 @@ export async function currentHeadOid(repoRoot: string, timeoutMs: number): Promi
 }
 
 /**
- * Refuse when `HEAD` is not the commit the browser's view was built from.
+ * Read the current branch as a fully-qualified-ref identity.
+ *
+ * `git symbolic-ref -q HEAD` rather than `rev-parse --abbrev-ref HEAD`: the latter
+ * answers the literal `HEAD` on a detached checkout and can answer `<kind>/<name>`
+ * when a short name is ambiguous, so neither can identify a branch. The prefix is
+ * stripped here and the name is only ever a display string; every comparison
+ * elsewhere stays on the full ref.
  * @param repoRoot - absolute repository root.
- * @param expected - the OID the client sent.
  * @param timeoutMs - deadline of the call.
+ * @returns the branch name, or null on a detached `HEAD`.
  */
-async function requireHead(repoRoot: string, expected: string | null, timeoutMs: number): Promise<void> {
-  const actual = await currentHeadOid(repoRoot, timeoutMs)
-  if (actual !== expected) {
+export async function readRepoBranch(repoRoot: string, timeoutMs: number): Promise<string | null> {
+  const result = await runGit({
+    cwd: repoRoot,
+    args: ['symbolic-ref', '-q', 'HEAD'],
+    timeoutMs,
+    allowExitCodes: [0, 1],
+  })
+  if (result.exitCode !== 0) return null
+  const ref = result.stdout.trim()
+  const prefix = 'refs/heads/'
+  return ref.startsWith(prefix) ? ref.slice(prefix.length) : ref
+}
+
+/**
+ * Refuse when `HEAD` is not the state the browser's view was built from.
+ *
+ * Identity is (branch, OID), not OID: two branches on one commit are common, and
+ * a terminal switch between loading the view and writing would otherwise commit
+ * onto the wrong branch silently. The branch is compared only when the caller
+ * sent it, so a raw OID-only caller keeps the previous contract.
+ * @param repoRoot - absolute repository root.
+ * @param expected - the OID, and optionally the branch, the client sent.
+ * @param timeoutMs - deadline of the call.
+ * @returns the OID and branch actually read, so a caller need not read them twice.
+ */
+export async function requireRepoState(
+  repoRoot: string,
+  expected: { readonly headOid: string | null, readonly branch?: string | null },
+  timeoutMs: number,
+): Promise<{ readonly headOid: string | null, readonly branch: string | null }> {
+  const actualHeadOid = await currentHeadOid(repoRoot, timeoutMs)
+  const checkBranch = expected.branch !== undefined
+  const actualBranch = checkBranch ? await readRepoBranch(repoRoot, timeoutMs) : null
+  const oidMoved = actualHeadOid !== expected.headOid
+  const branchMoved = checkBranch && (expected.branch ?? null) !== actualBranch
+  if (oidMoved || branchMoved) {
     throw new ApiHttpError(409, {
       code: 'HEAD_MOVED',
       message: 'the repository HEAD moved since this view was loaded; refresh and try again',
-      details: { expectedHeadOid: expected, actualHeadOid: actual },
+      details: {
+        expectedHeadOid: expected.headOid,
+        actualHeadOid,
+        ...(checkBranch ? { expectedBranch: expected.branch ?? null, actualBranch } : {}),
+      },
     })
   }
+  return { headOid: actualHeadOid, branch: actualBranch }
 }
 
 /**
@@ -225,11 +269,13 @@ export async function commitRepo(options: {
   readonly timeoutMs: number
 }): Promise<CommitResponse> {
   const { repoRoot, request, timeoutMs } = options
-  await requireHead(repoRoot, request.expectedHeadOid, timeoutMs)
+  const expectedBranch = request.expectedBranch
+  await requireRepoState(repoRoot, { headOid: request.expectedHeadOid, ...(expectedBranch === undefined ? {} : { branch: expectedBranch }) }, timeoutMs)
 
   const indexFile = join(tmpdir(), `dsh-intellij-git-${randomUUID()}.index`)
   let commitSha: string | null = null
   let headMovedDuringCommit = false
+  let branchMovedDuringCommit = false
 
   try {
     if (request.expectedHeadOid !== null) {
@@ -260,13 +306,20 @@ export async function commitRepo(options: {
       ? await expectedGrandparent(repoRoot, request.expectedHeadOid, timeoutMs)
       : request.expectedHeadOid
     headMovedDuringCommit = expectedParent !== null && parentOid !== expectedParent
+    // A switch can land between the compare-and-swap above and `git commit`
+    // itself. Re-reading the branch narrows that window to a reported mismatch;
+    // it cannot close it, because git has no atomic symref compare-and-swap.
+    if (expectedBranch !== undefined) {
+      const branchAfter = await readRepoBranch(repoRoot, timeoutMs)
+      branchMovedDuringCommit = branchAfter !== (expectedBranch ?? null)
+    }
   } finally {
     await unlink(indexFile).catch(() => undefined)
   }
 
   const sync = await syncRealIndex(repoRoot, touchedPaths(request.files), timeoutMs)
 
-  if (!request.push) return { committed: true, commitSha, indexSynced: sync.synced, ...(sync.error === undefined ? {} : { indexSyncError: sync.error }), headMovedDuringCommit, pushed: false }
+  if (!request.push) return { committed: true, commitSha, indexSynced: sync.synced, ...(sync.error === undefined ? {} : { indexSyncError: sync.error }), headMovedDuringCommit, branchMovedDuringCommit, pushed: false }
 
   const pushTarget = await readPushTarget(repoRoot, timeoutMs)
   if (pushTarget === null) {
@@ -279,6 +332,7 @@ export async function commitRepo(options: {
       indexSynced: sync.synced,
       ...(sync.error === undefined ? {} : { indexSyncError: sync.error }),
       headMovedDuringCommit,
+      branchMovedDuringCommit,
       pushed: false,
       pushErrorCode: 'NO_PUSH_TARGET',
       pushError: `no push target is configured for this branch; set one with: ${hint}`,
@@ -293,6 +347,7 @@ export async function commitRepo(options: {
       indexSynced: sync.synced,
       ...(sync.error === undefined ? {} : { indexSyncError: sync.error }),
       headMovedDuringCommit,
+      branchMovedDuringCommit,
       pushed: true,
       pushTarget,
     }
@@ -303,6 +358,7 @@ export async function commitRepo(options: {
       indexSynced: sync.synced,
       ...(sync.error === undefined ? {} : { indexSyncError: sync.error }),
       headMovedDuringCommit,
+      branchMovedDuringCommit,
       pushed: false,
       pushTarget,
       pushErrorCode: classifyPushError(error),
@@ -356,7 +412,8 @@ export async function rollbackRepo(options: {
   readonly timeoutMs: number
 }): Promise<RollbackResponse> {
   const { repoRoot, request, timeoutMs } = options
-  await requireHead(repoRoot, request.expectedHeadOid, timeoutMs)
+  const expectedBranch = request.expectedBranch
+  await requireRepoState(repoRoot, { headOid: request.expectedHeadOid, ...(expectedBranch === undefined ? {} : { branch: expectedBranch }) }, timeoutMs)
   const headOid = await currentHeadOid(repoRoot, timeoutMs)
   const prepared = await preflightRollback(repoRoot, request, timeoutMs)
   const done: string[] = []
@@ -520,7 +577,7 @@ async function noPushTargetError(repoRoot: string, timeoutMs: number): Promise<A
  * @param timeoutMs - deadline of each call.
  * @returns the marker names that are present, rebase states first.
  */
-async function markersPresent(repoRoot: string, timeoutMs: number): Promise<string[]> {
+export async function markersPresent(repoRoot: string, timeoutMs: number): Promise<string[]> {
   const present: string[] = []
   for (const marker of OPERATION_MARKERS) {
     const result = await runGit({ cwd: repoRoot, args: ['rev-parse', '--git-path', marker], timeoutMs })
@@ -663,7 +720,9 @@ export async function integrateRepo(options: {
 }): Promise<SyncResponse> {
   const { repoRoot, request, timeoutMs } = options
   const mode = request.mode
-  await requireHead(repoRoot, request.expectedHeadOid, timeoutMs)
+  const expectedBranch = request.expectedBranch
+  const expectedState = { headOid: request.expectedHeadOid, ...(expectedBranch === undefined ? {} : { branch: expectedBranch }) }
+  await requireRepoState(repoRoot, expectedState, timeoutMs)
 
   const pushTarget = await readPushTarget(repoRoot, timeoutMs)
   if (pushTarget === null) throw await noPushTargetError(repoRoot, timeoutMs)
@@ -700,7 +759,8 @@ export async function integrateRepo(options: {
       }
     }
     await runGit({ cwd: repoRoot, args: ['fetch', remote], timeoutMs })
-    await requireHead(repoRoot, request.expectedHeadOid, timeoutMs)
+    // A fetch can move refs, so the same (branch, OID) check runs again.
+    await requireRepoState(repoRoot, expectedState, timeoutMs)
     try {
       await runGit({
         cwd: repoRoot,

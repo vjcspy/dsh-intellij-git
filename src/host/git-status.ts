@@ -77,6 +77,7 @@ export async function readStatus(repoRoot: string, repoId: string, timeoutMs: nu
   return {
     repoId,
     branch: parsed.branch,
+    detached: parsed.detached,
     headOid: parsed.headOid,
     headShortSha: parsed.headOid === null ? 'initial' : parsed.headOid.slice(0, 7),
     lastCommitMessage,
@@ -124,6 +125,8 @@ export async function readWatch(repoRoot: string, timeoutMs: number): Promise<Om
 /** Branch facts and untracked paths from `--porcelain=v2 --branch -z`. */
 interface PorcelainV2 {
   readonly branch: string
+  /** True when `branch.head` is porcelain's `(detached)` sentinel. */
+  readonly detached: boolean
   readonly headOid: string | null
   readonly upstream: string | null
   readonly ahead: number
@@ -164,7 +167,9 @@ export function parsePorcelainV2(raw: string): PorcelainV2 {
     }
     if (record.startsWith('? ')) unversioned.push(record.slice(2))
   }
-  return { branch, headOid, upstream, ahead, behind, unversioned }
+  // The sentinel is machine-stable ASCII from porcelain, not localized prose, so
+  // reading it costs no extra process and cannot drift with the git locale.
+  return { branch, detached: branch === '(detached)', headOid, upstream, ahead, behind, unversioned }
 }
 
 /**

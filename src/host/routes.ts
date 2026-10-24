@@ -26,10 +26,14 @@ import {
   type ApiErrorBody,
   type CommitRequest,
   type FileInclusionRequest,
+  type BranchesResponse,
   type GenerateMessageRequest,
   type RepoStatusResponse,
   type RollbackRequest,
   type RouteSpec,
+  type SwitchRequest,
+  type SwitchResponse,
+  type SwitchTarget,
   type SyncMode,
   type SyncRequest,
   type WatchResponse,
@@ -38,6 +42,7 @@ import {
 import type { ActivityLog } from './activity-log.ts'
 import { generateCommitMessage } from './commit-message-ai.ts'
 import { readFileDiff } from './git-diff.ts'
+import { listBranches, switchBranch as switchBranchOp } from './git-branches.ts'
 import { commitRepo, integrateRepo, rollbackRepo } from './git-operations.ts'
 import { readStatus, readWatch } from './git-status.ts'
 import { ApiHttpError } from './http-error.ts'
@@ -136,6 +141,46 @@ function parseInclusions(raw: unknown): FileInclusionRequest[] {
 }
 
 /**
+ * One switch target as the client sends it.
+ * @param raw - the request's `target` field.
+ * @returns the validated target, or null when it is not one.
+ */
+function parseTarget(raw: unknown): SwitchTarget | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const record = raw as Record<string, unknown>
+  const kind = record['kind']
+  const name = record['name']
+  if (kind !== 'local' && kind !== 'remote' && kind !== 'new') return null
+  if (typeof name !== 'string' || name === '') return null
+  return { kind, name }
+}
+
+/**
+ * Read the optional `expectedBranch` leniently.
+ *
+ * Three distinct answers, deliberately: a string checks that branch, `null`
+ * checks that `HEAD` was detached, and an absent field skips the branch half of
+ * the compare-and-swap so a raw OID-only caller keeps the old contract.
+ * @param raw - the request's `expectedBranch` field.
+ * @returns the branch, null, or undefined to skip the check.
+ */
+function parseExpectedBranch(raw: unknown): string | null | undefined {
+  if (raw === undefined) return undefined
+  if (raw === null) return null
+  return typeof raw === 'string' ? raw : undefined
+}
+
+/**
+ * The `expectedBranch` field to spread into a request, when the client sent one.
+ * @param raw - the request's `expectedBranch` field.
+ * @returns an object carrying the field, or an empty object to skip the check.
+ */
+function expectedBranchField(raw: unknown): { readonly expectedBranch?: string | null } {
+  const value = parseExpectedBranch(raw)
+  return value === undefined ? {} : { expectedBranch: value }
+}
+
+/**
  * Build the handlers of every route.
  * @param options - resolved root and settings.
  * @returns one handler per route key.
@@ -181,6 +226,7 @@ export function createHandlers(ctx: Context, options: RouteOptions): Record<Rout
     const payload: RollbackRequest = {
       repoId: String(body['repoId']),
       expectedHeadOid: typeof body['expectedHeadOid'] === 'string' ? body['expectedHeadOid'] : null,
+      ...expectedBranchField(body['expectedBranch']),
       files: parseInclusions(body['files']),
       confirmDeletePaths: body['confirmDeletePaths'] === true,
     }
@@ -196,6 +242,7 @@ export function createHandlers(ctx: Context, options: RouteOptions): Record<Rout
     const payload: CommitRequest = {
       repoId: String(body['repoId']),
       expectedHeadOid: typeof body['expectedHeadOid'] === 'string' ? body['expectedHeadOid'] : null,
+      ...expectedBranchField(body['expectedBranch']),
       message: typeof body['message'] === 'string' ? body['message'] : '',
       amend: body['amend'] === true,
       files: parseInclusions(body['files']),
@@ -255,9 +302,42 @@ export function createHandlers(ctx: Context, options: RouteOptions): Record<Rout
     const payload: SyncRequest = {
       repoId: String(body['repoId']),
       expectedHeadOid: typeof body['expectedHeadOid'] === 'string' ? body['expectedHeadOid'] : null,
+      ...expectedBranchField(body['expectedBranch']),
       mode: rawMode as SyncMode,
     }
     return ok(await integrateRepo({ repoRoot, request: payload, timeoutMs: INTEGRATE_TIMEOUT_MS }))
+  }
+
+  const branches = async (request: Request): Promise<Response> => {
+    const body = await jsonBody(request)
+    if (body instanceof Response) return body
+    const root = await requireRoot(options.aweaveRoot)
+    const repoId = typeof body['repoId'] === 'string' ? body['repoId'] : ''
+    const repoRoot = await repoRootOf(root, repoId)
+    options.activity.setRoot(repoRoot)
+    const response: BranchesResponse = await listBranches(repoRoot, repoId, timeoutMs)
+    return ok(response)
+  }
+
+  const switchBranch = async (request: Request): Promise<Response> => {
+    const body = await jsonBody(request)
+    if (body instanceof Response) return body
+    const root = await requireRoot(options.aweaveRoot)
+    const repoId = typeof body['repoId'] === 'string' ? body['repoId'] : ''
+    const repoRoot = await repoRootOf(root, repoId)
+    options.activity.setRoot(repoRoot)
+    const target = parseTarget(body['target'])
+    if (target === null) {
+      return fail(400, { code: 'INVALID_REQUEST', message: 'target must be {kind: local|remote|new, name: <non-empty string>}' })
+    }
+    const payload: SwitchRequest = {
+      repoId,
+      target,
+      expectedHeadOid: typeof body['expectedHeadOid'] === 'string' ? body['expectedHeadOid'] : null,
+      ...expectedBranchField(body['expectedBranch']),
+    }
+    const response: SwitchResponse = await switchBranchOp(repoRoot, payload, timeoutMs)
+    return ok(response)
   }
 
   const activity = async (request: Request): Promise<Response> => {
@@ -282,7 +362,7 @@ export function createHandlers(ctx: Context, options: RouteOptions): Record<Rout
     return ok(response)
   }
 
-  return { tree, status, diff, rollback, commit, generateMessage, watch, sync, activity, activityClear }
+  return { tree, status, diff, rollback, commit, generateMessage, watch, sync, branches, switchBranch, activity, activityClear }
 }
 
 /**

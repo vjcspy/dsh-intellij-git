@@ -1,6 +1,6 @@
 {
   "name": "dsh-intellij-git",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DSH Web plugin: an IntelliJ IDEA style Git page (commit tree, interactive diff viewer and live grouped activity log) in the main area, opened from the left sidebar, spanning Aweave's root repo and every workspace repository.",
   "license": "MIT",
   "type": "module",

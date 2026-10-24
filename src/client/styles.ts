@@ -49,6 +49,15 @@ const CSS = `
 [data-dsh-git] .git-title { font-size: 14px; font-weight: 600; }
 [data-dsh-git] .git-repoName { color: var(--dsw-alias-label-secondary); }
 [data-dsh-git] .git-branchTag { display: inline-flex; align-items: center; gap: 4px; }
+[data-dsh-git] .git-branchBtn {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 32ch; padding: 1px 6px;
+  border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; background: none;
+  color: inherit; font: inherit; cursor: pointer; transition: background 120ms ease;
+}
+[data-dsh-git] .git-branchBtn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+[data-dsh-git] .git-branchBtn:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+[data-dsh-git] .git-branchBtn:disabled { opacity: 0.55; cursor: default; }
+[data-dsh-git] .git-branchBtnName { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 [data-dsh-git] .git-bar {
   position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; overflow: hidden;
   opacity: 0; transition: opacity 120ms ease;
@@ -276,9 +285,47 @@ const CSS = `
 .dsh-git-dialog .git-tipAnchor { display: inline-flex; }
 .dsh-git-dialog .git-running { display: inline-flex; align-items: center; gap: 6px; color: var(--dsw-alias-label-secondary); }
 .dsh-git-dialog .git-danger { --dsw-alias-button-primary-fill: var(--dsw-alias-state-error-primary); }
+.dsh-git-dialog .git-branchBody { display: flex; flex-direction: column; gap: 8px; min-height: 0; font-size: 13px; }
+.dsh-git-dialog .git-branchFilter {
+  width: 100%; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); font: inherit;
+}
+.dsh-git-dialog .git-branchFilter:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: -1px; }
+.dsh-git-dialog .git-branchFilter:disabled { opacity: 0.6; }
+.dsh-git-dialog .git-branchScroll { max-height: 42vh; overflow: auto; }
+.dsh-git-dialog .git-branchGroup { display: flex; flex-direction: column; gap: 1px; }
+.dsh-git-dialog .git-branchGroupLabel {
+  text-transform: uppercase; letter-spacing: 0.06em; font-size: 10px;
+  color: var(--dsw-alias-label-tertiary); padding: 4px 2px 2px;
+}
+.dsh-git-dialog .git-branchHint { margin: 0; color: var(--dsw-alias-label-tertiary); font-size: 11px; }
+.dsh-git-dialog .git-branchRow {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 6px; border: 0;
+  border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left;
+  cursor: pointer; transition: background 120ms ease;
+}
+.dsh-git-dialog .git-branchRow:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+.dsh-git-dialog .git-branchRow[data-selected='true'] { background: var(--dsw-alias-interactive-bg-active); }
+.dsh-git-dialog .git-branchRow:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: -1px; }
+.dsh-git-dialog .git-branchRow:disabled { opacity: 0.55; cursor: default; }
+.dsh-git-dialog .git-branchRow[aria-current='true'] .git-branchName { font-weight: 600; }
+.dsh-git-dialog .git-branchName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-git-dialog .git-branchUnit { flex: none; color: var(--dsw-alias-label-tertiary); font-size: 11px; white-space: nowrap; }
+.dsh-git-dialog .git-branchCurrent { flex: none; color: var(--dsw-alias-brand-primary); font-size: 11px; }
+.dsh-git-dialog .git-branchEmpty { padding: 6px 4px; }
+.dsh-git-dialog .git-branchError {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4px 8px; border-radius: 6px;
+  background: var(--dsw-alias-state-error-secondary); color: var(--dsw-alias-state-error-primary);
+}
+.dsh-git-dialog .git-branchNew { display: flex; flex-direction: column; gap: 4px; }
+.dsh-git-dialog .git-branchEffect { color: var(--dsw-alias-label-secondary); font-size: 12px; }
+.dsh-git-dialog .git-branchFooter { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.dsh-git-dialog .git-branchFooterRow { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 
 @media (prefers-reduced-motion: reduce) {
   [data-dsh-git] .git-barFill { animation: none; width: 40%; }
+  [data-dsh-git] .git-branchBtn, .dsh-git-dialog .git-branchRow { transition: none; }
   [data-dsh-git] .git-skel { animation: none; }
   [data-dsh-git] .git-bar, [data-dsh-git] .git-row, [data-dsh-git] .git-twistyGlyph,
   [data-dsh-git] .git-groupBtn, [data-dsh-git] .git-callBtn, [data-dsh-git] .git-splitter::after { transition: none; }

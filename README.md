@@ -20,10 +20,44 @@ The plugin adds one row, **Git**, to the left sidebar panel list (directly under
 * **Bottom dock, activity** - every git call and API call the plugin made, grouped by request (one row per user action
   with its `git` rows nested), live while a long action runs, with a `Show background` switch for watcher-driven
   requests, per-call Copy, and Clear.
-* **Page header** - repository, branch, ahead/behind, last-checked time, Refresh, and `Push...` when the branch is ahead.
+* **Page header** - repository, branch badge (the branch dialog's trigger), ahead/behind, last-checked time, Refresh,
+  and `Push...` when the branch is ahead.
   The split between the columns and the dock height are draggable (keyboard: arrow keys) and remembered per browser.
 
 Colours come only from the platform's `--dsw-alias-*` design tokens, so the page follows the active theme.
+
+## The branch dialog
+
+Clicking the branch badge opens an IntelliJ-style **Branches** dialog: a filter box, a `Local` group with the current
+branch pinned and marked, a `Remote` group, and a `New branch` mode that creates from the current `HEAD`. A detached
+`HEAD` is shown as `(detached at <sha>)` and can be left by picking any branch.
+
+* **One confirmation, informative.** The dialog *is* the confirmation for the write: a state-generated line beside
+  the primary button names the exact effect (`Switch main → feature; 2 changed files carry over`, or
+  `Create feature at 1a2b3c4`). There is no second dialog and no double-click submit.
+* **Remote branches create or reuse a local tracking branch.** A remote row is hidden only when a same-named local
+  branch already tracks that exact ref, and selecting it then reuses that branch. A same-named local that tracks
+  something else keeps the remote row visible but disabled, and the call is refused with `BRANCH_EXISTS`.
+* **No fetch.** The `Remote` group reflects the last fetch; the dialog never reaches the network.
+* **Worktree-held branches are marked** and refused with the worktree path, because this plugin also discovers
+  worktree checkouts (`.git` files).
+
+### Dirty worktree: refused, precisely
+
+A switch never stashes, never forces and never discards. When git refuses, the host classifies the failure from
+repository state instead of git's (translated) stderr: it intersects the paths the working tree changed with the paths
+that differ between `HEAD` and the target tree, and adds untracked paths that the target tree would create. A
+non-empty intersection answers `409 LOCAL_CHANGES_BLOCK_SWITCH` listing those paths. Anything it cannot explain
+degrades to `409 SWITCH_FAILED` carrying the switch's own exit code and stderr tail, so a refusal can never become a
+`500`. Edits that do not overlap the target tree simply carry over, which is what `2 changed files carry over` counts.
+
+### Ref identity
+
+Every internal comparison, existence check, `--track` start point and `git diff` revision uses a fully-qualified ref
+(`refs/heads/...`, `refs/remotes/...`). Display names come from `%(refname:lstrip=2)`, and the current branch from
+`git symbolic-ref -q HEAD`. Short names are ambiguity-dependent: a branch and a tag sharing a name shorten to
+`heads/<name>`, and a local branch literally named `<remote>/<branch>` makes the remote short name ambiguous, which
+breaks both `rev-parse --verify` and a bare `--track` start point.
 
 ## Processing states
 
@@ -50,8 +84,16 @@ between groups while you tick them, and a concurrent `git add` by another proces
 * **No remote guessing.** `Commit and Push...` resolves `@{push}` and runs a plain `git push`. When the branch has
   no push target the commit is kept and the push is refused with the exact `git push -u <remote> <branch>` command,
   because on this deployment `origin` is frequently an unrelated repository.
-* **`HEAD` compare-and-swap.** Both commit and rollback send the `HEAD` the view was built from; the host answers
-  `409` when it moved, and verifies `HEAD^1` again after committing.
+* **`HEAD` compare-and-swap on (branch, OID).** Commit, rollback, sync and switch send both the `HEAD` and the branch
+  the view was built from; the host answers `409 HEAD_MOVED` naming both when either moved. OID alone is not identity:
+  two branches on one commit are common, so an OID-only check would commit onto the wrong branch silently after a
+  terminal switch. An `expectedBranch` that is omitted keeps the older OID-only behaviour, so a raw caller still works.
+  `HEAD^1` is verified again after committing, the branch is re-read and reported as `branchMovedDuringCommit`, and
+  sync re-checks across its `git fetch` because a fetch can move refs.
+* **One mutating command per branch request.** `git switch --no-guess` without `-f`, `--force`, `--autostash` or
+  `--discard-changes`, and no fetch. `switch` only resolves refs, so a branch name can never be read as a path, and
+  `--no-guess` removes DWIM branch creation. An operation marker (`rebase-merge`, `rebase-apply`, `MERGE_HEAD`,
+  `CHERRY_PICK_HEAD`, `REVERT_HEAD`) refuses the switch with `409 INTEGRATION_IN_PROGRESS`.
 * **Path containment.** A `repoId` is re-derived into an absolute path from a validated id and re-checked with
   `realpath`; every repository-relative path is re-resolved inside that repository.
 
@@ -91,8 +133,29 @@ All of them sit under `/api/dsh-intellij-git/` and are registered through `ctx.c
 | `repo/generate-message` | POST | Commit message from the current selection |
 | `repo/watch` | POST | Silent change probe (digest compare); recorded nowhere |
 | `repo/sync` | POST | `push`, `rebase` or `merge` leg of an integrate |
+| `repo/branches` | POST | Local and remote-tracking branches with current, upstream and worktree facts |
+| `repo/switch` | POST | One switch, tracking-branch create or reuse; never fetches, forces or stashes |
 | `activity` | GET | Retained call log; `?after=<id>` returns only newer entries; silent |
 | `activity/clear` | POST | Empty the log; answers `{cleared, bootId, latestId}`; silent |
+
+### Branch error codes
+
+| Code | Status | Meaning |
+| --- | --- | --- |
+| `LOCAL_CHANGES_BLOCK_SWITCH` | 409 | The listed paths differ between the two trees and would be overwritten |
+| `BRANCH_CHECKED_OUT_ELSEWHERE` | 409 | The branch is held by another worktree; `details.path` is its real path |
+| `BRANCH_EXISTS` | 409 | The name already exists, or a same-named local tracks a different ref |
+| `BRANCH_NOT_FOUND` | 404 | The ref vanished between listing and switch |
+| `INVALID_BRANCH_NAME` | 400 | `git check-ref-format --branch` refused it, or expanded it to another name |
+| `HEAD_MOVED` | 409 | The branch or `HEAD` is no longer the one the listing was built from |
+| `INTEGRATION_IN_PROGRESS` | 409 | A rebase, merge, cherry-pick or revert marker is present |
+| `SWITCH_FAILED` | 409 | git refused for a reason the state comparison could not explain |
+
+## Requirements
+
+Tested on git `2.51`; requires at least `2.31` (`git switch`, `--no-guess` and `%(worktreepath)`). Verified at the
+`basic` level of this domain's container procedure: gates, boot, routes and probes, with the browser half left to the
+Human.
 
 ## Build
 
