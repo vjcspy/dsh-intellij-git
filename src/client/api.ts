@@ -6,6 +6,8 @@
  * back as `401` and never reaches `git`.
  */
 import type {
+  ActivityClearResponse,
+  ActivityListResponse,
   ApiErrorBody,
   CommitRequest,
   CommitResponse,
@@ -15,6 +17,9 @@ import type {
   RepoStatusResponse,
   RollbackRequest,
   RollbackResponse,
+  SyncRequest,
+  SyncResponse,
+  WatchResponse,
   WorkspaceTreeResponse,
 } from '../config.ts'
 import { ROUTES } from '../config.ts'
@@ -101,4 +106,12 @@ export const api = {
   commit: (body: CommitRequest): Promise<CommitResponse> => post<CommitResponse>('commit', body),
   /** Generate a commit message from the selected changes. */
   generateMessage: (body: GenerateMessageRequest): Promise<GenerateMessageResponse> => post<GenerateMessageResponse>('generateMessage', body),
+  /** The silent digest probe the watcher ticks with. */
+  watch: (body: { repoId: string }): Promise<WatchResponse> => post<WatchResponse>('watch', body),
+  /** Push, or integrate the push target and push. */
+  sync: (body: SyncRequest): Promise<SyncResponse> => post<SyncResponse>('sync', body),
+  /** The host-side activity buffer. */
+  activity: (): Promise<ActivityListResponse> => call<ActivityListResponse>('activity', { method: 'GET' }),
+  /** Drop every recorded activity entry. */
+  clearActivity: (): Promise<ActivityClearResponse> => post<ActivityClearResponse>('activityClear', {}),
 }

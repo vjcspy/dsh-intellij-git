@@ -67,6 +67,14 @@ export function apply(ctx: ClientContext): void {
     },
   })
 
+  // The tab body is `keepMounted`, so the store starts its own load and its own
+  // poll once: a freshly opened tab is populated without a click, and the watcher
+  // has an active repository to probe.
+  ctx.effect(() => {
+    void store.actions.bootstrap()
+    return store.actions.startWatch()
+  }, 'dsh-intellij-git: bootstrap and live change list')
+
   ctx.effect(() => ctx.sidebarRightTabs.register({
     id: COMMIT_TAB_ID,
     kind: COMMIT_TAB_KIND,

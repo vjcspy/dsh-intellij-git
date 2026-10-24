@@ -11,12 +11,13 @@
  * inclusion in the store, so the section header, a folder and the diff
  * sub-header can never disagree.
  */
-import { useSyncExternalStore, type ReactNode } from 'react'
+import { useEffect, useRef, useSyncExternalStore, type ReactNode } from 'react'
 import { Button, Checkbox, FileTypeIcon, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 
-import { ROOT_REPO_ID } from '../config.ts'
+import { ROOT_REPO_ID, type ActivityEntry } from '../config.ts'
 import { ConfirmDialog } from './ConfirmDialog.tsx'
+import { IntegrateDialog } from './IntegrateDialog.tsx'
 import type { DshIntellijGitKey } from './locale.ts'
 import { groupsOf, selectedInclusions, type IntellijGitStore } from './store.ts'
 import { TriCheckbox } from './TriCheckbox.tsx'
@@ -58,6 +59,51 @@ function ActionButton(props: {
 }
 
 /**
+ * A `HH:mm:ss.SSS` clock label for one activity entry.
+ * @param at - epoch milliseconds.
+ * @returns the formatted time.
+ */
+function clockOf(at: number): string {
+  const date = new Date(at)
+  const pad = (value: number, width = 2): string => String(value).padStart(width, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`
+}
+
+/**
+ * One row of the activity dock, with its output behind a click.
+ * @param props - the entry, its expansion state, the locale seat and the toggle.
+ * @returns the row.
+ */
+function ActivityRow(props: {
+  readonly entry: ActivityEntry
+  readonly open: boolean
+  readonly t: PropsLocale<'dshIntellijGit'>['t']
+  readonly onToggle: () => void
+}): ReactNode {
+  const { entry, open, t } = props
+  return (
+    <div className="git-activityRow" data-ok={entry.ok}>
+      <Tooltip label={t('activity.expand.tip')} delayMs={600} portal>
+        <button type="button" className="git-activityBtn" aria-expanded={open} onClick={props.onToggle}>
+          <span className="git-activityTime git-mono">{clockOf(entry.at)}</span>
+          <span className="git-activityBadge" data-kind={entry.kind}>{entry.kind === 'api' ? t('activity.kind.api') : t('activity.kind.git')}</span>
+          <span className="git-activityLabel git-mono">{entry.label}</span>
+          <span className="git-activityDetail">{entry.detail}</span>
+          <span className="git-activityMs">{entry.durationMs} ms</span>
+          <span className="git-activityState" data-ok={entry.ok}>{entry.ok ? t('activity.ok') : t('activity.error')}</span>
+        </button>
+      </Tooltip>
+      {open ? (
+        <pre className="git-activityOutput">
+          {entry.output === undefined || entry.output === '' ? t('activity.noOutput') : entry.output}
+          {entry.truncated === true ? `\n${t('activity.truncated')}` : ''}
+        </pre>
+      ) : null}
+    </div>
+  )
+}
+
+/**
  * The Commit tool window body.
  * @param props - runtime and locale seats plus the shared store.
  * @returns the panel.
@@ -72,8 +118,29 @@ export function CommitTabBody(props: CommitTabProps): ReactNode {
   const selectedCount = repoId === null ? 0 : selectedInclusions(state, repoId).length
   const status = state.status
   const busy = state.busy !== null
+  const anyCollapsed = state.collapsedNodes.length > 0
+  const logRef = useRef<HTMLDivElement | null>(null)
 
-  const renderNode = (node: FileNode | DirNode, depth: number): ReactNode => {
+  // Follow new entries only while the Human is already at the bottom, so reading
+  // an older entry is never interrupted by a tick.
+  useEffect(() => {
+    const element = logRef.current
+    if (element === null) return
+    if (element.dataset['atBottom'] !== 'false') element.scrollTop = element.scrollHeight
+  }, [state.activity.length, state.activityOpen])
+
+  /**
+   * Render one file or directory row.
+   *
+   * Expansion is a denylist: a directory is expanded unless its key is in
+   * `collapsedNodes`, so a folder that appears only in a later status is expanded
+   * by construction rather than waiting for a click.
+   * @param node - the row.
+   * @param depth - indent depth.
+   * @param groupKey - which of the two groups the row belongs to.
+   * @returns the row.
+   */
+  const renderNode = (node: FileNode | DirNode, depth: number, groupKey: GroupNode['key']): ReactNode => {
     if (node.type === 'file') {
       const selected = state.selected?.path === node.path
       return (
@@ -95,12 +162,13 @@ export function CommitTabBody(props: CommitTabProps): ReactNode {
         </div>
       )
     }
-    const expanded = state.domainsExpanded.includes(`node:${node.key}`)
+    const dirKey = `${repoId ?? ROOT_REPO_ID}:${groupKey}:${node.key}`
+    const expanded = !state.collapsedNodes.includes(dirKey)
     return (
-      <div key={`d:${node.key}`}>
+      <div key={`d:${dirKey}`}>
         <div className="git-row" style={{ paddingLeft: `${6 + depth * 12}px` }}>
-          <Tooltip label={t('section.twisty.tip')} delayMs={500} portal>
-            <button type="button" className="git-twisty" onClick={() => { store.actions.toggleDomain(`node:${node.key}`) }}>
+          <Tooltip label={expanded ? t('dir.open.tip', { name: node.name }) : t('dir.close.tip', { name: node.name })} delayMs={500} portal>
+            <button type="button" className="git-twisty" aria-expanded={expanded} onClick={() => { store.actions.toggleDir(dirKey) }}>
               <span className="git-twistyGlyph" data-open={expanded}>{expanded ? '▾' : '▸'}</span>
             </button>
           </Tooltip>
@@ -111,7 +179,7 @@ export function CommitTabBody(props: CommitTabProps): ReactNode {
           <span className="git-label git-mono">{node.name}</span>
           <span className="git-count">{node.count}</span>
         </div>
-        {expanded ? node.children.map(child => renderNode(child, depth + 1)) : null}
+        {expanded ? node.children.map(child => renderNode(child, depth + 1, groupKey)) : null}
       </div>
     )
   }
@@ -125,7 +193,7 @@ export function CommitTabBody(props: CommitTabProps): ReactNode {
         <span className="git-label git-groupLabel">{t(labelKey)}</span>
         <span className="git-count">{group.count === 1 ? t('section.file') : t('section.files', { count: group.count })}</span>
       </div>
-      {group.children.map(child => renderNode(child, 1))}
+      {group.children.map(child => renderNode(child, 1, group.key))}
     </div>
   )
 
@@ -168,7 +236,7 @@ export function CommitTabBody(props: CommitTabProps): ReactNode {
   return (
     <div data-dsh-git="commit">
       <div className="git-toolbar">
-        <ActionButton tip={t('toolbar.refresh.tip')} label={t('toolbar.refresh')} onClick={() => { void store.actions.refreshTree() }} />
+        <ActionButton tip={t('toolbar.refresh.tip')} label={t('toolbar.refresh')} onClick={() => { void store.actions.refreshAll() }} />
         <ActionButton
           tip={t('toolbar.rollback.tip')}
           disabledTip={t('commit.button.disabled.tip')}
@@ -178,11 +246,21 @@ export function CommitTabBody(props: CommitTabProps): ReactNode {
         />
         <ActionButton
           tip={t('toolbar.compact.tip')}
-          label={state.compactFolders ? t('toolbar.collapseAll') : t('toolbar.expandAll')}
+          label={t('toolbar.compact')}
           onClick={() => { store.actions.toggleCompact() }}
         />
+        <ActionButton
+          tip={anyCollapsed ? t('toolbar.expandAll.tip') : t('toolbar.collapseAll.tip')}
+          label={anyCollapsed ? t('toolbar.expandAll') : t('toolbar.collapseAll')}
+          onClick={() => { if (anyCollapsed) store.actions.expandAllDirs(); else store.actions.collapseAllDirs() }}
+        />
         <span className="git-grow" />
-        {state.statusLoading ? <span className="git-dim">{t('state.loading')}</span> : null}
+        {state.watchFailing ? <span className="git-warn">{t('state.watchFailed')}</span> : null}
+        {state.statusLoading
+          ? <span className="git-dim">{t('state.loading')}</span>
+          : state.lastCheckedAt === null
+            ? null
+            : <span className="git-dim git-mono">{t('toolbar.updated', { time: clockOf(state.lastCheckedAt).slice(0, 8) })}</span>}
       </div>
       {banner}
 
@@ -319,10 +397,68 @@ export function CommitTabBody(props: CommitTabProps): ReactNode {
             label={t('commit.pushButton')}
             onClick={() => { store.actions.requestCommit(true) }}
           />
+          {status !== null && status.ahead > 0 ? (
+            // The commit already exists, so this stays available with nothing
+            // ticked: it publishes what the branch is ahead by, through the same
+            // confirmation every other write uses.
+            <ActionButton
+              variant="outline"
+              tip={t('commit.pushRetry.tip')}
+              disabledTip={t('toolbar.busy.tip')}
+              disabled={busy}
+              label={state.busy === 'sync' ? t('toolbar.busy.tip') : t('commit.pushRetry')}
+              onClick={() => { store.actions.requestPush() }}
+            />
+          ) : null}
         </div>
       </div>
 
+      <div className="git-activity" data-open={state.activityOpen}>
+        <div className="git-activityHead">
+          <Tooltip label={t('activity.toggle.tip')} delayMs={500} portal>
+            <button type="button" className="git-twisty" aria-expanded={state.activityOpen} onClick={() => { store.actions.toggleActivity() }}>
+              <span className="git-twistyGlyph" data-open={state.activityOpen}>{state.activityOpen ? '▾' : '▸'}</span>
+            </button>
+          </Tooltip>
+          <span className="git-label git-groupLabel">{t('activity.title')}</span>
+          <span className="git-count">{t('activity.count', { count: state.activity.length })}</span>
+          <span className="git-grow" />
+          <ActionButton tip={t('activity.refresh.tip')} label={t('activity.refresh')} onClick={() => { void store.actions.refreshActivity() }} />
+          <ActionButton
+            tip={t('activity.clear.tip')}
+            disabledTip={t('activity.empty')}
+            disabled={state.activity.length === 0}
+            label={t('activity.clear')}
+            onClick={() => { void store.actions.clearActivity() }}
+          />
+        </div>
+        {state.activityOpen ? (
+          <div
+            className="git-activityBody"
+            role="log"
+            ref={logRef}
+            onScroll={event => {
+              const element = event.currentTarget
+              element.dataset['atBottom'] = element.scrollHeight - element.scrollTop - element.clientHeight > 8 ? 'false' : 'true'
+            }}
+          >
+            {state.activity.length === 0
+              ? <div className="git-activityEmpty">{t('activity.empty')}</div>
+              : state.activity.map(entry => (
+                <ActivityRow
+                  key={entry.id}
+                  entry={entry}
+                  open={state.activityDetail.includes(entry.id)}
+                  t={t}
+                  onToggle={() => { store.actions.toggleActivityDetail(entry.id) }}
+                />
+              ))}
+          </div>
+        ) : null}
+      </div>
+
       <ConfirmDialog store={store} origin="commit" t={t} />
+      <IntegrateDialog store={store} t={t} />
     </div>
   )
 }

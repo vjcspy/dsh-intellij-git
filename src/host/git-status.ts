@@ -7,14 +7,32 @@
  * change. `git diff HEAD --name-status` answers exactly that question, and
  * porcelain v2 is kept for the branch facts and the untracked list.
  */
-import type { FileChangeEntry, RepoStatusResponse } from '../config.ts'
+import { createHash } from 'node:crypto'
+
+import type { FileChangeEntry, RepoStatusResponse, WatchResponse } from '../config.ts'
 import { runGit } from './git-runner.ts'
 
 /** Depth of the log message read for the Amend prefill. */
 const LOG_FORMAT = '%H%x00%h%x00%B'
 
+/** The one command whose output both `readStatus` and `readWatch` digest. */
+const PORCELAIN_ARGS = ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'] as const
+
 /** Bytes of the branch/untracked porcelain output parsed per call. */
 const FIELD = (value: string | undefined): string => (value ?? '').trim()
+
+/**
+ * Hash the raw porcelain output.
+ *
+ * Both the status and the watch probe call this with the stdout of the same
+ * command line, so the two routes cannot diverge: a digest built any other way
+ * would make the browser observe a permanent mismatch and refresh every tick.
+ * @param stdout - raw `git status --porcelain=v2 --branch -z` output.
+ * @returns the SHA-1 hex digest.
+ */
+export function porcelainDigest(stdout: string): string {
+  return createHash('sha1').update(stdout).digest('hex')
+}
 
 /**
  * Read the status of one repository.
@@ -26,7 +44,7 @@ const FIELD = (value: string | undefined): string => (value ?? '').trim()
 export async function readStatus(repoRoot: string, repoId: string, timeoutMs: number): Promise<RepoStatusResponse> {
   const porcelain = await runGit({
     cwd: repoRoot,
-    args: ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'],
+    args: [...PORCELAIN_ARGS],
     timeoutMs,
   })
   const parsed = parsePorcelainV2(porcelain.stdout)
@@ -70,6 +88,36 @@ export async function readStatus(repoRoot: string, repoId: string, timeoutMs: nu
     remotes,
     changes,
     unversioned: parsed.unversioned,
+    statusDigest: porcelainDigest(porcelain.stdout),
+  }
+}
+
+/**
+ * Read only what the watcher needs: the digest plus the branch facts.
+ *
+ * One `git status` per tick, with `GIT_OPTIONAL_LOCKS=0` so the probe never takes
+ * or rewrites the index while a commit or another agent's `git add` runs. The
+ * command line and the digest helper are shared with `readStatus`, so the two
+ * answers agree byte for byte; the probe deliberately returns no file lists,
+ * because the browser only compares the digest.
+ * @param repoRoot - absolute repository root.
+ * @param timeoutMs - deadline of the call.
+ * @returns the digest and the branch facts.
+ */
+export async function readWatch(repoRoot: string, timeoutMs: number): Promise<Omit<WatchResponse, 'repoId'>> {
+  const porcelain = await runGit({
+    cwd: repoRoot,
+    args: [...PORCELAIN_ARGS],
+    timeoutMs,
+    env: { GIT_OPTIONAL_LOCKS: '0' },
+  })
+  const parsed = parsePorcelainV2(porcelain.stdout)
+  return {
+    digest: porcelainDigest(porcelain.stdout),
+    headOid: parsed.headOid,
+    branch: parsed.branch,
+    ahead: parsed.ahead,
+    behind: parsed.behind,
   }
 }
 

@@ -50,14 +50,31 @@ export const MAX_AI_DIFF_BYTES = 16_000
 /** Upper bound on the bytes of any single file this plugin reads for a diff. */
 export const MAX_DIFF_FILE_BYTES = 4 * 1024 * 1024
 
+/** Entries the host-side activity ring buffer keeps. */
+export const ACTIVITY_CAPACITY = 150
+
+/** Characters of one entry's captured output that survive into the buffer. */
+export const ACTIVITY_OUTPUT_LIMIT = 1024
+
+/** Cadence of the browser's digest poll, in milliseconds. */
+export const WATCH_INTERVAL_MS = 5_000
+
+/** Deadline of every `git` call on the fetch/rebase/merge/push path, in milliseconds. */
+export const INTEGRATE_TIMEOUT_MS = 120_000
+
 /** One route this plugin registers. */
 export interface RouteSpec {
   /** Route key used by the browser half. */
-  readonly key: 'tree' | 'status' | 'diff' | 'rollback' | 'commit' | 'generateMessage'
+  readonly key: 'tree' | 'status' | 'diff' | 'rollback' | 'commit' | 'generateMessage' | 'watch' | 'sync' | 'activity' | 'activityClear'
   /** Path below the API prefix. */
   readonly path: string
   /** The one HTTP method the handler serves; the other channel verb answers 405. */
   readonly method: 'GET' | 'POST'
+  /**
+   * True when the request and the `git` calls it makes stay out of the activity
+   * buffer, so housekeeping never evicts a real action from it.
+   */
+  readonly silent?: boolean
 }
 
 /** The route table. */
@@ -68,6 +85,10 @@ export const ROUTES: readonly RouteSpec[] = [
   { key: 'rollback', path: `${API_PREFIX}/repo/rollback`, method: 'POST' },
   { key: 'commit', path: `${API_PREFIX}/repo/commit`, method: 'POST' },
   { key: 'generateMessage', path: `${API_PREFIX}/repo/generate-message`, method: 'POST' },
+  { key: 'watch', path: `${API_PREFIX}/repo/watch`, method: 'POST', silent: true },
+  { key: 'sync', path: `${API_PREFIX}/repo/sync`, method: 'POST' },
+  { key: 'activity', path: `${API_PREFIX}/activity`, method: 'GET', silent: true },
+  { key: 'activityClear', path: `${API_PREFIX}/activity/clear`, method: 'POST', silent: true },
 ]
 
 /** HTTP methods the shared `/api` channel dispatches to an exact Fetch route. */
@@ -143,6 +164,13 @@ export interface RepoStatusResponse {
   readonly changes: readonly FileChangeEntry[]
   /** Untracked paths. */
   readonly unversioned: readonly string[]
+  /**
+   * SHA-1 of the raw `git status --porcelain=v2 --branch -z --untracked-files=all`
+   * output this status was built from. `repo/watch` hashes the same command with
+   * the same helper, so the two routes agree by construction and the browser only
+   * has to compare one string.
+   */
+  readonly statusDigest: string
 }
 
 /** One changed line span inside a hunk. */
@@ -205,6 +233,14 @@ export interface CommitRequest {
   readonly push: boolean
 }
 
+/**
+ * Why a push did not land.
+ *
+ * `PUSH_REJECTED` is git's own non-fast-forward refusal, which the tool window
+ * answers with the rebase-or-merge offer; everything else stays `PUSH_FAILED`.
+ */
+export type PushErrorCode = 'NO_PUSH_TARGET' | 'PUSH_REJECTED' | 'PUSH_FAILED'
+
 /** Answer of `repo/commit`. */
 export interface CommitResponse {
   readonly committed: boolean
@@ -215,8 +251,81 @@ export interface CommitResponse {
   readonly headMovedDuringCommit: boolean
   readonly pushed: boolean
   readonly pushTarget?: string
-  readonly pushErrorCode?: 'NO_PUSH_TARGET' | 'PUSH_FAILED'
+  readonly pushErrorCode?: PushErrorCode
   readonly pushError?: string
+}
+
+/** Body of `repo/watch`. */
+export interface WatchRequest {
+  readonly repoId: string
+}
+
+/** Answer of `repo/watch`: the digest and the branch facts, never the file lists. */
+export interface WatchResponse {
+  /** SHA-1 of the raw porcelain output, the same value `RepoStatusResponse.statusDigest` carries. */
+  readonly digest: string
+  readonly headOid: string | null
+  readonly branch: string
+  readonly ahead: number
+  readonly behind: number
+}
+
+/**
+ * How `repo/sync` integrates the push target.
+ *
+ * `push` is the push-only leg the persistent `Push…` action uses; `rebase` and
+ * `merge` are the two orders offered after a rejected push.
+ */
+export type SyncMode = 'push' | 'rebase' | 'merge'
+
+/** Body of `repo/sync`. */
+export interface SyncRequest {
+  readonly repoId: string
+  /** The `HEAD` the browser's view was built from; the Host refuses a moved `HEAD`. */
+  readonly expectedHeadOid: string | null
+  readonly mode: SyncMode
+}
+
+/** Answer of `repo/sync`. */
+export interface SyncResponse {
+  readonly mode: SyncMode
+  readonly headOid: string | null
+  readonly headShortSha: string
+  readonly pushed: boolean
+  readonly pushTarget?: string
+  readonly pushErrorCode?: PushErrorCode
+  readonly pushError?: string
+  /** Paths left unmerged by an integration that then aborted; always null on success. */
+  readonly conflictPaths?: readonly string[]
+}
+
+/** One recorded action: an `/api` request or a `git` invocation. */
+export interface ActivityEntry {
+  /** Monotonic per-host-process id; also the React row key. */
+  readonly id: number
+  /** Epoch milliseconds when the action settled. */
+  readonly at: number
+  readonly kind: 'api' | 'git'
+  /** Short name: the route key, or `git <subcommand>`. */
+  readonly label: string
+  /** One line of context: method/path/status, or argv/cwd/exit code. */
+  readonly detail: string
+  readonly ok: boolean
+  readonly durationMs: number
+  /** Captured output, already truncated to `ACTIVITY_OUTPUT_LIMIT` characters. */
+  readonly output?: string
+  /** True when `output` was cut. */
+  readonly truncated?: boolean
+}
+
+/** Answer of `activity`. */
+export interface ActivityListResponse {
+  readonly entries: readonly ActivityEntry[]
+}
+
+/** Answer of `activity/clear`. */
+export interface ActivityClearResponse {
+  readonly cleared: number
 }
 
 /** Body of `repo/rollback`. */

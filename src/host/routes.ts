@@ -18,7 +18,10 @@ import type { ConnectionFetchRoute } from '@deepseek-ai/dsh-client-connection'
 
 import {
   CHANNEL_METHODS,
+  INTEGRATE_TIMEOUT_MS,
   ROUTES,
+  type ActivityClearResponse,
+  type ActivityListResponse,
   type ApiErrorBody,
   type CommitRequest,
   type FileInclusionRequest,
@@ -26,12 +29,16 @@ import {
   type RepoStatusResponse,
   type RollbackRequest,
   type RouteSpec,
+  type SyncMode,
+  type SyncRequest,
+  type WatchResponse,
   type WorkspaceTreeResponse,
 } from '../config.ts'
+import type { ActivityLog } from './activity-log.ts'
 import { generateCommitMessage } from './commit-message-ai.ts'
 import { readFileDiff } from './git-diff.ts'
-import { commitRepo, rollbackRepo } from './git-operations.ts'
-import { readStatus } from './git-status.ts'
+import { commitRepo, integrateRepo, rollbackRepo } from './git-operations.ts'
+import { readStatus, readWatch } from './git-status.ts'
 import { ApiHttpError } from './http-error.ts'
 import { discoverTree, isInside, resolveAweaveRoot, resolveRepoPath } from './workspace-tree.ts'
 
@@ -41,6 +48,8 @@ export interface RouteOptions {
   readonly gitTimeoutMs: number
   readonly llmProvider: string
   readonly llmModel: string
+  /** The activity buffer every request and every `git` call is recorded in. */
+  readonly activity: ActivityLog
 }
 
 /** Largest request body any route accepts. */
@@ -215,7 +224,52 @@ export function createHandlers(ctx: Context, options: RouteOptions): Record<Rout
     }))
   }
 
-  return { tree, status, diff, rollback, commit, generateMessage }
+  /**
+   * The silent probe: one `git status` compared by digest on the browser side.
+   *
+   * The whole handler runs `silenced`, not just the record call, or the tick's
+   * own `git status` would still reach the observer and evict real entries from
+   * the bounded buffer.
+   */
+  const watch = async (request: Request): Promise<Response> => {
+    const body = await jsonBody(request)
+    if (body instanceof Response) return body
+    const root = await requireRoot(options.aweaveRoot)
+    options.activity.setRoot(root)
+    const repoRoot = await repoRootOf(root, body['repoId'])
+    const response: WatchResponse = await options.activity.silenced(() => readWatch(repoRoot, timeoutMs))
+    return ok(response)
+  }
+
+  const sync = async (request: Request): Promise<Response> => {
+    const body = await jsonBody(request)
+    if (body instanceof Response) return body
+    const root = await requireRoot(options.aweaveRoot)
+    options.activity.setRoot(root)
+    const repoRoot = await repoRootOf(root, body['repoId'])
+    const rawMode = typeof body['mode'] === 'string' ? body['mode'] : ''
+    if (rawMode !== 'push' && rawMode !== 'rebase' && rawMode !== 'merge') {
+      return fail(400, { code: 'BAD_MODE', message: 'mode must be push, rebase or merge' })
+    }
+    const payload: SyncRequest = {
+      repoId: String(body['repoId']),
+      expectedHeadOid: typeof body['expectedHeadOid'] === 'string' ? body['expectedHeadOid'] : null,
+      mode: rawMode as SyncMode,
+    }
+    return ok(await integrateRepo({ repoRoot, request: payload, timeoutMs: INTEGRATE_TIMEOUT_MS }))
+  }
+
+  const activity = async (): Promise<Response> => {
+    const response: ActivityListResponse = { entries: options.activity.list() }
+    return ok(response)
+  }
+
+  const activityClear = async (): Promise<Response> => {
+    const response: ActivityClearResponse = { cleared: options.activity.clear() }
+    return ok(response)
+  }
+
+  return { tree, status, diff, rollback, commit, generateMessage, watch, sync, activity, activityClear }
 }
 
 /**
@@ -251,12 +305,29 @@ export function registerRoutes(ctx: Context, options: RouteOptions): void {
         if (request.method !== spec.method) {
           return fail(405, { code: 'METHOD_NOT_ALLOWED', message: `use ${spec.method}` }, { allow: spec.method })
         }
+        const startedAt = Date.now()
+        let response: Response
         try {
-          return await handler(request)
+          response = await handler(request)
         } catch (error) {
-          if (error instanceof ApiHttpError) return fail(error.status, error.body)
-          return fail(500, { code: 'INTERNAL', message: error instanceof Error ? error.message : String(error) })
+          response = error instanceof ApiHttpError
+            ? fail(error.status, error.body)
+            : fail(500, { code: 'INTERNAL', message: error instanceof Error ? error.message : String(error) })
         }
+        if (spec.silent !== true) {
+          // Cloning before reading keeps the caller's body intact: consuming the
+          // original would hand the browser an empty response.
+          const body = await response.clone().text().catch(() => '')
+          options.activity.recordApi({
+            key: spec.key,
+            method: request.method,
+            path: new URL(request.url).pathname,
+            status: response.status,
+            durationMs: Date.now() - startedAt,
+            output: body,
+          })
+        }
+        return response
       },
     }
     ctx.effect(() => {

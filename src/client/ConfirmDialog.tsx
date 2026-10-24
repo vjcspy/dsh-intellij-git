@@ -62,9 +62,32 @@ export function ConfirmDialog(props: ConfirmDialogProps): ReactNode {
               : t('confirm.commit.push', { target: status.pushTarget }))
             : null}
         </p>
+        {pending.push && status !== null && status.behind > 0
+          // The tracking ref is never fetched before committing, so this says
+          // "may be refused" rather than guessing at a rejection.
+          ? <p className="git-warn">{t('confirm.commit.pushBehind', { behind: status.behind })}</p>
+          : null}
       </div>
     )
     confirmLabel = pending.push ? t('confirm.push.action') : t('confirm.commit.action')
+  } else if (pending.kind === 'push') {
+    title = t('confirm.push.title')
+    body = (
+      <div className="git-confirmBody">
+        {status === null
+          ? null
+          : (
+            <p>
+              {t('confirm.push.body', {
+                branch: status.branch,
+                ahead: status.ahead,
+                target: status.pushTarget ?? t('confirm.commit.pushNone'),
+              })}
+            </p>
+          )}
+      </div>
+    )
+    confirmLabel = t('confirm.pushNow.action')
   } else if (pending.kind === 'rollback') {
     title = t('confirm.rollback.title')
     destructive = true

@@ -12,6 +12,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 
 import { PLUGIN_ID } from './config.ts'
+import { createActivityLog } from './host/activity-log.ts'
+import { setGitObserver } from './host/git-runner.ts'
 import { registerRoutes } from './host/routes.ts'
 import type { Config } from './schema.ts'
 
@@ -27,15 +29,20 @@ export const name = PLUGIN_ID
 export const inject = ['connection']
 
 /**
- * Register the fenced routes.
+ * Register the fenced routes and attach the one activity observer.
  * @param ctx - Host context owning the `connection` service.
  * @param config - validated live configuration resolved by the Loader.
  */
 export function apply(ctx: Context, config: Config): void {
+  const activity = createActivityLog()
+  // The observer owns module-level state, so its lifetime is the plugin's: the
+  // disposer restores whatever observer was there before.
+  ctx.effect(() => setGitObserver(event => { activity.recordGit(event) }), 'dsh-intellij-git: activity observer')
   registerRoutes(ctx, {
     aweaveRoot: config.aweaveRoot,
     gitTimeoutMs: config.gitTimeoutMs,
     llmProvider: config.llmProvider,
     llmModel: config.llmModel,
+    activity,
   })
 }

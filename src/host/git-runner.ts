@@ -57,6 +57,58 @@ export interface RunGitResult {
   readonly exitCode: number
 }
 
+/** One settled invocation, as an observer sees it. */
+export interface GitRunEvent {
+  /** Arguments after the executable name. */
+  readonly args: readonly string[]
+  /** Repository working directory. */
+  readonly cwd: string
+  /** Exit code, or `-1` when the process never started or was killed on the deadline. */
+  readonly exitCode: number
+  /** Wall-clock duration of the call. */
+  readonly durationMs: number
+  /** True when the exit code was one the caller allowed. */
+  readonly ok: boolean
+  readonly stdout: string
+  readonly stderr: string
+  /** Extra environment the call carried, when it carried any. */
+  readonly env?: Readonly<Record<string, string>>
+}
+
+/** The single observer every invocation reports to, when one is installed. */
+let observer: ((event: GitRunEvent) => void) | undefined
+
+/**
+ * Install the observer that sees every `git` invocation.
+ *
+ * One observer rather than a recorder threaded through every call site: the
+ * module's stated property is that this is the one place the plugin spawns git,
+ * so an assignment here covers every current and future call.
+ * @param next - the observer, or undefined to detach.
+ * @returns a disposer restoring the previous observer.
+ */
+export function setGitObserver(next?: (event: GitRunEvent) => void): () => void {
+  const previous = observer
+  observer = next
+  return () => { observer = previous }
+}
+
+/**
+ * Report one settled invocation to the observer, exactly once.
+ *
+ * A throwing observer must never fail the command it observes: recording is a
+ * side effect, and the caller's exit-code contract is what the plugin runs on.
+ * @param event - the settled invocation.
+ */
+function notify(event: GitRunEvent): void {
+  if (observer === undefined) return
+  try {
+    observer(event)
+  } catch {
+    // A broken observer is not a broken command.
+  }
+}
+
 /**
  * Run one `git` command.
  * @param options - the invocation.
@@ -65,6 +117,8 @@ export interface RunGitResult {
  */
 export function runGit(options: RunGitOptions): Promise<RunGitResult> {
   const allowed = options.allowExitCodes ?? [0]
+  const startedAt = Date.now()
+  let observed = false
   return new Promise<RunGitResult>((resolve, reject) => {
     const child = spawn('git', [...options.args], {
       cwd: options.cwd,
@@ -82,6 +136,28 @@ export function runGit(options: RunGitOptions): Promise<RunGitResult> {
       child.kill('SIGKILL')
     }, options.timeoutMs)
 
+    /**
+     * Report this invocation once, whatever settles it.
+     * @param exitCode - the process exit code.
+     * @param stdout - captured stdout.
+     * @param stderr - captured stderr.
+     * @param ok - whether the caller counts the code as success.
+     */
+    const report = (exitCode: number, stdout: string, stderr: string, ok: boolean): void => {
+      if (observed) return
+      observed = true
+      notify({
+        args: options.args,
+        cwd: options.cwd,
+        exitCode,
+        durationMs: Date.now() - startedAt,
+        ok,
+        stdout,
+        stderr,
+        ...(options.env === undefined ? {} : { env: options.env }),
+      })
+    }
+
     const finish = (fn: () => void): void => {
       if (settled) return
       settled = true
@@ -92,7 +168,10 @@ export function runGit(options: RunGitOptions): Promise<RunGitResult> {
     child.stdout.on('data', (chunk: Buffer) => { out.push(chunk) })
     child.stderr.on('data', (chunk: Buffer) => { err.push(chunk) })
     child.on('error', (error: Error) => {
-      finish(() => { reject(new GitCommandError(`git ${options.args[0] ?? ''}: ${error.message}`, -1, '')) })
+      finish(() => {
+        report(-1, '', '', false)
+        reject(new GitCommandError(`git ${options.args[0] ?? ''}: ${error.message}`, -1, ''))
+      })
     })
     child.on('close', (code: number | null) => {
       const stdout = Buffer.concat(out).toString('utf8')
@@ -100,13 +179,16 @@ export function runGit(options: RunGitOptions): Promise<RunGitResult> {
       const exitCode = code ?? -1
       finish(() => {
         if (killedByTimeout) {
+          report(-1, stdout, stderr, false)
           reject(new GitCommandError(`git ${options.args[0] ?? ''} timed out after ${options.timeoutMs}ms`, -1, stderr))
           return
         }
         if (!allowed.includes(exitCode)) {
+          report(exitCode, stdout, stderr, false)
           reject(new GitCommandError(`git ${options.args.join(' ')} exited ${exitCode}: ${stderr.trim().slice(0, 800)}`, exitCode, stderr))
           return
         }
+        report(exitCode, stdout, stderr, true)
         resolve({ stdout, stderr, exitCode })
       })
     })

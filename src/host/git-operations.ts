@@ -16,7 +16,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { stat, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import type {
   CommitRequest,
@@ -24,12 +24,16 @@ import type {
   DiffHunk,
   FileChangeEntry,
   FileInclusionRequest,
+  PushErrorCode,
   RollbackRequest,
   RollbackResponse,
+  SyncMode,
+  SyncRequest,
+  SyncResponse,
 } from '../config.ts'
 import { buildPatch, readFileDiff } from './git-diff.ts'
-import { runGit, runGitWithIndex } from './git-runner.ts'
-import { readPushTarget } from './git-status.ts'
+import { GitCommandError, runGit, runGitWithIndex } from './git-runner.ts'
+import { parseLines, readPushTarget } from './git-status.ts'
 import { ApiHttpError } from './http-error.ts'
 import { resolveRepoFile } from './workspace-tree.ts'
 
@@ -38,6 +42,21 @@ const INDEX_SYNC_ATTEMPTS = 5
 
 /** Delay between index-lock retries, in milliseconds. */
 const INDEX_SYNC_DELAY_MS = 100
+
+/** git's own non-fast-forward refusal, which is the one push failure the UI can act on. */
+const PUSH_REJECTION_PATTERN = /non-fast-forward|fetch first|\[rejected\]/i
+
+/** Phrases git uses when it refuses an integration because local contents are in the way. */
+const WORKTREE_REFUSAL_PATTERN = /would be overwritten|unstaged changes|uncommitted changes|cannot merge|cannot rebase|Please commit or stash/i
+
+/**
+ * Markers git leaves behind while an operation is in progress.
+ *
+ * `rebase-merge`/`rebase-apply` are the rebase states, `MERGE_HEAD` the merge
+ * state; a cherry-pick or revert in progress is the same class of state, so it
+ * refuses the same way instead of failing obscurely underneath.
+ */
+const OPERATION_MARKERS = ['rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'] as const
 
 /**
  * Read the current `HEAD` OID.
@@ -286,10 +305,26 @@ export async function commitRepo(options: {
       headMovedDuringCommit,
       pushed: false,
       pushTarget,
-      pushErrorCode: 'PUSH_FAILED',
+      pushErrorCode: classifyPushError(error),
       pushError: error instanceof Error ? error.message : String(error),
     }
   }
+}
+
+/**
+ * Classify a push failure from git's own stderr.
+ *
+ * Only a non-fast-forward rejection earns `PUSH_REJECTED`, because only that one
+ * has a path forward the UI can offer. A hook rejection, a protected branch or a
+ * transport error stays `PUSH_FAILED` with its raw message kept.
+ * @param error - the thrown failure.
+ * @returns the code the browser branches on.
+ */
+export function classifyPushError(error: unknown): PushErrorCode {
+  const text = error instanceof GitCommandError
+    ? error.stderr
+    : error instanceof Error ? error.message : String(error)
+  return PUSH_REJECTION_PATTERN.test(text) ? 'PUSH_REJECTED' : 'PUSH_FAILED'
 }
 
 /**
@@ -406,7 +441,11 @@ async function preflightRollback(repoRoot: string, request: RollbackRequest, tim
     const diff = await readFileDiff({ repoRoot, path: file.path, origPath: file.origPath ?? null, status: file.status, timeoutMs })
     const wanted = diff.hunks.filter(hunk => keys.includes(hunk.contentKey))
     if (wanted.length !== keys.length) {
-      throw new ApiHttpError(409, { code: 'STALE_HUNKS', message: 'the file changed on disk since this diff was loaded; refresh and try again' })
+      throw new ApiHttpError(409, {
+        code: 'STALE_HUNKS',
+        message: 'the file changed on disk since this diff was loaded; refresh and try again',
+        details: { path: file.path, missing: keys.filter(key => !wanted.some(hunk => hunk.contentKey === key)) },
+      })
     }
     prepared.set(file.path, wanted)
   }
@@ -425,6 +464,270 @@ function requireDeleteConfirmation(confirmed: boolean, path: string): void {
     message: `rolling back ${path} deletes it from disk; confirm the deletion first`,
     details: { path },
   })
+}
+
+/**
+ * The current branch name, or `HEAD` when detached.
+ * @param repoRoot - absolute repository root.
+ * @param timeoutMs - deadline of the call.
+ * @returns the branch name.
+ */
+async function currentBranch(repoRoot: string, timeoutMs: number): Promise<string> {
+  const result = await runGit({ cwd: repoRoot, args: ['rev-parse', '--abbrev-ref', 'HEAD'], timeoutMs })
+  const branch = result.stdout.trim()
+  return branch === '' ? 'HEAD' : branch
+}
+
+/**
+ * The remote this branch pushes to.
+ *
+ * git's own answer rather than the first segment of `@{push}`: a remote or ref
+ * containing a slash would make that split fetch from the wrong place.
+ * @param repoRoot - absolute repository root.
+ * @param branch - the branch being pushed.
+ * @param timeoutMs - deadline of the call.
+ * @returns the remote name, or an empty string when the branch has no push remote.
+ */
+async function pushRemoteName(repoRoot: string, branch: string, timeoutMs: number): Promise<string> {
+  const result = await runGit({
+    cwd: repoRoot,
+    args: ['for-each-ref', '--format=%(push:remotename)', `refs/heads/${branch}`],
+    timeoutMs,
+  })
+  return result.stdout.trim()
+}
+
+/**
+ * The `NO_PUSH_TARGET` refusal, naming the exact command that would configure one.
+ * @param repoRoot - absolute repository root.
+ * @param timeoutMs - deadline of each call.
+ * @returns the error to throw.
+ */
+async function noPushTargetError(repoRoot: string, timeoutMs: number): Promise<ApiHttpError> {
+  const remotes = parseLines((await runGit({ cwd: repoRoot, args: ['remote'], timeoutMs })).stdout)
+  const branch = await currentBranch(repoRoot, timeoutMs)
+  const hint = remotes.length === 1 ? `git push -u ${remotes[0] ?? 'origin'} ${branch}` : `git push -u <remote> ${branch}`
+  return new ApiHttpError(400, {
+    code: 'NO_PUSH_TARGET',
+    message: `no push target is configured for this branch; set one with: ${hint}`,
+    details: { branch, remotes },
+  })
+}
+
+/**
+ * Which operation markers exist in this repository.
+ * @param repoRoot - absolute repository root.
+ * @param timeoutMs - deadline of each call.
+ * @returns the marker names that are present, rebase states first.
+ */
+async function markersPresent(repoRoot: string, timeoutMs: number): Promise<string[]> {
+  const present: string[] = []
+  for (const marker of OPERATION_MARKERS) {
+    const result = await runGit({ cwd: repoRoot, args: ['rev-parse', '--git-path', marker], timeoutMs })
+    const raw = result.stdout.trim()
+    if (raw === '') continue
+    const absolute = isAbsolute(raw) ? raw : join(repoRoot, raw)
+    const found = await stat(absolute).catch(() => null)
+    if (found !== null) present.push(marker)
+  }
+  return present
+}
+
+/**
+ * Paths the integration left unmerged.
+ * @param repoRoot - absolute repository root.
+ * @param timeoutMs - deadline of the call.
+ * @returns the repository-relative paths, read before any abort clears them.
+ */
+async function unmergedPaths(repoRoot: string, timeoutMs: number): Promise<string[]> {
+  const result = await runGit({
+    cwd: repoRoot,
+    args: ['diff', '--name-only', '--diff-filter=U', '-z'],
+    timeoutMs,
+  })
+  return result.stdout.split('\0').filter(path => path !== '')
+}
+
+/**
+ * The path a single `git status --porcelain` line names.
+ *
+ * The record is exactly `XY PATH`: two fixed status columns, one space, then the
+ * path, and the first column is a space for an unstaged-only change. The line is
+ * therefore sliced positionally and must never be trimmed first - trimming
+ * ` M a.txt` yields `M a.txt`, whose first byte would then be lost.
+ * @param line - one porcelain record, verbatim.
+ * @returns the destination path.
+ */
+function pathOfPorcelainLine(line: string): string {
+  const rest = line.length > 3 ? line.slice(3) : ''
+  const arrow = rest.indexOf(' -> ')
+  return arrow === -1 ? rest.trim() : rest.slice(arrow + 4).trim()
+}
+
+/**
+ * Paths named in git's "would be overwritten" block.
+ * @param stderr - git's own refusal text.
+ * @returns the indented paths it listed.
+ */
+function blockedPaths(stderr: string): string[] {
+  return stderr.split('\n')
+    .filter(line => /^\s+\S/.test(line))
+    .map(line => line.trim())
+    .filter(line => line !== '' && !line.startsWith('Aborting'))
+}
+
+/**
+ * Turn an integration failure into a classified refusal, never a 500.
+ *
+ * The abort runs only when a marker proves an operation is actually in
+ * progress: measured on git 2.51, `git merge --abort` with no `MERGE_HEAD` and
+ * `git rebase --abort` with no `rebase-merge` both exit 128, which `runGit`
+ * would surface as an internal error hiding the real cause. Unmerged paths are
+ * read before the abort, because the abort clears them.
+ * @param repoRoot - absolute repository root.
+ * @param mode - the order that was attempted.
+ * @param error - what the integration threw.
+ * @param timeoutMs - deadline of each call.
+ * @returns the error to throw.
+ */
+async function integrationFailure(repoRoot: string, mode: SyncMode, error: unknown, timeoutMs: number): Promise<ApiHttpError> {
+  const recovery = mode === 'rebase' ? 'git rebase --abort' : 'git merge --abort'
+  const stderr = error instanceof GitCommandError ? error.stderr : error instanceof Error ? error.message : String(error)
+  const killed = error instanceof GitCommandError && error.exitCode === -1
+  const markers = await markersPresent(repoRoot, timeoutMs)
+
+  const stuck = (detail: string, extra: Record<string, unknown>): ApiHttpError => new ApiHttpError(409, {
+    code: 'INTEGRATION_STUCK',
+    message: `${detail}; recover with ${recovery}. A stale index.lock must only be removed once no git process holds it`,
+    details: { mode, recovery, marker: markers[0], markers, stderr, note: 'check git rev-parse --git-path index.lock', ...extra },
+  })
+
+  if (markers.length === 0) {
+    if (killed) return stuck(`the ${mode} did not finish before the deadline`, {})
+    if (WORKTREE_REFUSAL_PATTERN.test(stderr)) {
+      return new ApiHttpError(409, {
+        code: 'WORKTREE_DIRTY',
+        message: `${mode} was refused because local contents are in the way; commit or stash them and try again`,
+        details: { paths: blockedPaths(stderr) },
+      })
+    }
+    return new ApiHttpError(409, {
+      code: 'INTEGRATE_REFUSED',
+      message: `${mode} was refused: ${stderr.trim().slice(0, 800)}`,
+      details: { stderr },
+    })
+  }
+
+  const unmerged = await unmergedPaths(repoRoot, timeoutMs)
+  try {
+    await runGit({
+      cwd: repoRoot,
+      args: mode === 'rebase' ? ['rebase', '--abort'] : ['merge', '--abort'],
+      timeoutMs,
+    })
+  } catch (abortError) {
+    return stuck(`the ${mode} failed and could not be aborted`, {
+      abortError: abortError instanceof Error ? abortError.message : String(abortError),
+    })
+  }
+
+  if (unmerged.length > 0) {
+    return new ApiHttpError(409, {
+      code: 'INTEGRATE_CONFLICT',
+      message: `${mode} hit a conflict in ${unmerged.length === 1 ? 'one path' : `${unmerged.length} paths`}; the integration was aborted and the commit kept`,
+      details: { paths: unmerged },
+    })
+  }
+  return new ApiHttpError(409, {
+    code: 'INTEGRATE_FAILED',
+    message: `${mode} failed and was aborted: ${stderr.trim().slice(0, 800)}`,
+    details: { stderr },
+  })
+}
+
+/**
+ * Push, or integrate the push target and then push.
+ *
+ * The order matters and is fixed here: cheap local refusals first (`HEAD`
+ * compare-and-swap, push target, an operation already in progress), then the
+ * network fetch, then the `HEAD` re-check the CAS needs across that round trip,
+ * then the integration, then the push. Nothing here force-pushes, guesses a
+ * remote, autostashes another agent's work, or retries automatically.
+ * @param options - repository root, request body and the integration deadline.
+ * @returns the push outcome, with a second failure classified like the first.
+ */
+export async function integrateRepo(options: {
+  readonly repoRoot: string
+  readonly request: SyncRequest
+  readonly timeoutMs: number
+}): Promise<SyncResponse> {
+  const { repoRoot, request, timeoutMs } = options
+  const mode = request.mode
+  await requireHead(repoRoot, request.expectedHeadOid, timeoutMs)
+
+  const pushTarget = await readPushTarget(repoRoot, timeoutMs)
+  if (pushTarget === null) throw await noPushTargetError(repoRoot, timeoutMs)
+  const branch = await currentBranch(repoRoot, timeoutMs)
+  const remote = await pushRemoteName(repoRoot, branch, timeoutMs)
+  if (remote === '') throw await noPushTargetError(repoRoot, timeoutMs)
+
+  if (mode !== 'push') {
+    const markers = await markersPresent(repoRoot, timeoutMs)
+    if (markers.length > 0) {
+      throw new ApiHttpError(409, {
+        code: 'INTEGRATION_IN_PROGRESS',
+        message: `this repository already has an operation in progress (${markers.join(', ')}); finish or abort it first`,
+        details: { marker: markers[0], markers },
+      })
+    }
+    if (mode === 'rebase') {
+      // Exactly the condition git itself refuses: tracked changes. Untracked
+      // paths never block, and `--autostash` is never used because it would
+      // temporarily revert other agents' files in this shared tree.
+      const porcelain = await runGit({
+        cwd: repoRoot,
+        args: ['status', '--porcelain', '--untracked-files=no'],
+        timeoutMs,
+      })
+      // Split verbatim: `parseLines` trims, which would eat the first column.
+      const dirty = porcelain.stdout.split('\n').filter(line => line !== '')
+      if (dirty.length > 0) {
+        throw new ApiHttpError(409, {
+          code: 'WORKTREE_DIRTY',
+          message: 'rebase refuses to run with uncommitted changes to tracked files; commit or stash them, or choose merge, which may still succeed',
+          details: { paths: dirty.map(pathOfPorcelainLine) },
+        })
+      }
+    }
+    await runGit({ cwd: repoRoot, args: ['fetch', remote], timeoutMs })
+    await requireHead(repoRoot, request.expectedHeadOid, timeoutMs)
+    try {
+      await runGit({
+        cwd: repoRoot,
+        args: mode === 'rebase' ? ['rebase', pushTarget] : ['merge', '--no-edit', pushTarget],
+        timeoutMs,
+      })
+    } catch (error) {
+      throw await integrationFailure(repoRoot, mode, error, timeoutMs)
+    }
+  }
+
+  const headOid = await currentHeadOid(repoRoot, timeoutMs)
+  const headShortSha = headOid === null ? 'initial' : headOid.slice(0, 7)
+  try {
+    await runGit({ cwd: repoRoot, args: ['push'], timeoutMs })
+  } catch (error) {
+    return {
+      mode,
+      headOid,
+      headShortSha,
+      pushed: false,
+      pushTarget,
+      pushErrorCode: classifyPushError(error),
+      pushError: error instanceof Error ? error.message : String(error),
+    }
+  }
+  return { mode, headOid, headShortSha, pushed: true, pushTarget }
 }
 
 /**

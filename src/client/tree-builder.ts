@@ -223,3 +223,21 @@ export function filesOf(node: TreeNode | GroupNode): FileNode[] {
   if (node.type === 'file') return [node]
   return node.children.flatMap(child => filesOf(child))
 }
+
+/**
+ * Collect the key of every directory row under a node.
+ *
+ * Used by the expand/collapse-all control: expansion is a denylist, so
+ * "collapse everything" is exactly the set of keys this returns.
+ * @param node - the group to walk.
+ * @returns the directory keys, in tree order.
+ */
+export function dirKeysOf(node: TreeNode | GroupNode): string[] {
+  if (node.type === 'file') return []
+  const keys: string[] = []
+  for (const child of node.children) {
+    if (child.type !== 'dir') continue
+    keys.push(child.key, ...dirKeysOf(child))
+  }
+  return keys
+}
