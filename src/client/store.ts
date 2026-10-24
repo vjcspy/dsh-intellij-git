@@ -3,18 +3,18 @@
  *
  * One instance is created in `apply` and handed to both registrations, so the
  * Commit tree and the Diff viewer read and write the same inclusion map. The
- * class holds no React: components subscribe with `useSyncExternalStore`, which
- * keeps the view layer free to re-render however it likes.
+ * class holds no React: components subscribe with `useSyncExternalStore`.
  *
- * Two invariants live here rather than in the components:
+ * Three invariants live here rather than in the components:
  *
  * 1. **Single-Active-Repo Accordion.** At most one repository is expanded and
  *    therefore at most one repository has a loaded status; expanding another
- *    collapses the previous one and drops its status. That is what bounds every
- *    refresh to one `git status`.
- * 2. **Inclusion is client state.** Ticking a box never calls the host. The
- *    whole selection is materialised once, at Commit time, which is why
- *    untracked files never jump between groups while the Human is ticking.
+ *    collapses the previous one and drops its status. That bounds every refresh
+ *    to one `git status`.
+ * 2. **Inclusion is client state.** Ticking a box never calls the host.
+ * 3. **Nothing writes without a confirmation.** Commit, rollback and hunk revert
+ *    only set `pending`; the effect runs from `confirmPending()`. A control that
+ *    only reads state never sets it.
  */
 import {
   ROOT_REPO_ID,
@@ -27,7 +27,7 @@ import {
   type WorkspaceTreeResponse,
 } from '../config.ts'
 import { ApiError, api } from './api.ts'
-import { buildGroups, filesOf, type CheckState, type FileNode, type GroupNode } from './tree-builder.ts'
+import { buildGroups, filesOf, type DirNode, type GroupNode, type FileNode } from './tree-builder.ts'
 import type { DshIntellijGitKey } from './locale.ts'
 
 /** A translated message the view renders once. */
@@ -44,6 +44,12 @@ export interface SelectedFile {
   readonly origPath: string | null
   readonly status: FileChangeEntry['status'] | 'U'
 }
+
+/** The write the Human has been asked to confirm, and the pane that asked. */
+export type PendingAction =
+  | { readonly kind: 'commit', readonly origin: 'commit', readonly push: boolean }
+  | { readonly kind: 'rollback', readonly origin: 'commit' }
+  | { readonly kind: 'revertHunk', readonly origin: 'diff', readonly contentKey: string, readonly path: string }
 
 /** Everything the two tabs render from. */
 export interface IntellijGitState {
@@ -69,7 +75,8 @@ export interface IntellijGitState {
   readonly message: string
   readonly aiBusy: boolean
   readonly aiRoute: string | null
-  readonly busy: 'commit' | 'rollback' | null
+  readonly busy: 'commit' | 'rollback' | 'revertHunk' | null
+  readonly pending: PendingAction | null
   readonly banner: Banner | null
 }
 
@@ -86,16 +93,23 @@ export interface IntellijGitActions {
   toggleCollapse(): void
   toggleCompact(): void
   toggleGroup(group: GroupNode): void
-  toggleNode(node: FileNode | GroupNode | { type: 'dir', children: readonly unknown[] }): void
+  toggleNode(node: FileNode | DirNode | GroupNode): void
   toggleFile(file: FileNode): void
   toggleCurrentVersion(): void
   toggleHunk(contentKey: string): void
-  revertHunk(contentKey: string): Promise<void>
   setAmend(value: boolean): void
   setMessage(value: string): void
   generateMessage(sessionId: string | undefined): Promise<void>
-  commit(push: boolean): Promise<void>
-  rollback(): Promise<void>
+  /** Ask to commit; the write happens in `confirmPending`. */
+  requestCommit(push: boolean): void
+  /** Ask to roll back the ticked changes. */
+  requestRollback(): void
+  /** Ask to revert one hunk. */
+  requestRevertHunk(contentKey: string, path: string): void
+  /** Run the pending write. */
+  confirmPending(): Promise<void>
+  /** Drop the pending write without running it. */
+  cancelPending(): void
   dismissBanner(): void
 }
 
@@ -110,6 +124,21 @@ export interface IntellijGitStore {
 export interface StoreOptions {
   /** Open or focus the diff tab for the Session on screen. */
   readonly openDiffTab: (sessionId: string | undefined) => void
+}
+
+/**
+ * Whether reverting this entry deletes the file from disk.
+ *
+ * Mirrors the host's own predicate, so the dialog can never say "nothing is
+ * deleted" while a file disappears: `U` and `A` have no committed content, so any
+ * revert of them is a delete; `R` is a delete only whole-file, because a partial
+ * `R` is reversed as an edit and its file survives.
+ * @param status - the change status.
+ * @param partial - whether only some hunks are selected.
+ * @returns true when the path is removed.
+ */
+export function willDeleteEntry(status: FileChangeEntry['status'] | 'U', partial: boolean): boolean {
+  return status === 'U' || status === 'A' || (status === 'R' && !partial)
 }
 
 /**
@@ -142,6 +171,7 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     aiBusy: false,
     aiRoute: null,
     busy: null,
+    pending: null,
     banner: null,
   }
   const listeners = new Set<() => void>()
@@ -156,13 +186,13 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
   }
 
   /**
-   * Turn a thrown error into a banner key while keeping the message readable.
+   * Turn a thrown error into a banner.
    * @param error - the failure.
    * @param key - fallback dictionary key.
    */
   const failBanner = (error: unknown, key: DshIntellijGitKey): void => {
     const detail = error instanceof ApiError ? error.message : error instanceof Error ? error.message : String(error)
-    set({ banner: { kind: 'error', key, params: { reason: detail } }, busy: null, statusLoading: false, diffLoading: false, aiBusy: false })
+    set({ banner: { kind: 'error', key, params: { reason: detail } }, busy: null, pending: null, statusLoading: false, diffLoading: false, aiBusy: false })
   }
 
   /**
@@ -182,10 +212,10 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
   }
 
   /**
-   * Seed an inclusion for every path the status reports, defaulting to fully included.
+   * Seed an inclusion for every path the status reports, defaulting to included.
    *
-   * IntelliJ starts a changelist fully checked; defaulting to `all` is also what
-   * makes `Commit` do the obvious thing without fifty clicks.
+   * IntelliJ starts a changelist fully checked; that is also what makes Commit do
+   * the obvious thing without fifty clicks.
    * @param repoId - repository id.
    * @param status - the fresh status.
    * @returns the seeded map.
@@ -193,21 +223,22 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
   const seedInclusions = (repoId: string, status: RepoStatusResponse): Readonly<Record<string, FileInclusion>> => {
     const previous = inclusionsOf(repoId)
     const next: Record<string, FileInclusion> = {}
-    const paths = [...status.changes.map(entry => entry.path), ...status.unversioned]
-    for (const path of paths) next[path] = previous[path] ?? { mode: 'all' }
+    for (const path of [...status.changes.map(entry => entry.path), ...status.unversioned]) {
+      next[path] = previous[path] ?? { mode: 'all' }
+    }
     return next
   }
 
   /**
-   * Apply the same inclusion to every file under a node or group.
+   * Apply one inclusion value to every file under a node or group.
    * @param files - the target files.
-   * @param mode - the value to write.
+   * @param checked - the value to write.
    */
-  const applyToFiles = (files: readonly FileNode[], mode: CheckState): void => {
+  const applyToFiles = (files: readonly FileNode[], checked: boolean): void => {
     const repoId = state.activeRepoId
     if (repoId === null) return
     const current = { ...inclusionsOf(repoId) }
-    const value: FileInclusion = mode === 'checked' ? { mode: 'all' } : { mode: 'none' }
+    const value: FileInclusion = checked ? { mode: 'all' } : { mode: 'none' }
     for (const file of files) current[file.path] = value
     setInclusions(repoId, current)
   }
@@ -229,6 +260,8 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
 
   /**
    * Load one file's diff and reveal it.
+   * @param file - the file to show.
+   * @returns the diff.
    */
   const loadDiff = async (file: SelectedFile): Promise<FileDiffResponse> => {
     set({ diffLoading: true, diffError: null })
@@ -290,7 +323,7 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
       try {
         await loadDiff(file)
       } catch {
-        // The diff view renders `diffError`; nothing else to do here.
+        // Surfaced through `diffError`.
       }
     },
 
@@ -317,17 +350,16 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     },
 
     toggleGroup(group) {
-      applyToFiles(filesOf(group), group.check === 'checked' ? 'unchecked' : 'checked')
+      applyToFiles(filesOf(group), group.check !== 'checked')
     },
 
     toggleNode(node) {
       const files = filesOf(node as GroupNode)
-      const checked = files.every(file => file.check === 'checked')
-      applyToFiles(files, checked ? 'unchecked' : 'checked')
+      applyToFiles(files, !files.every(file => file.check === 'checked'))
     },
 
     toggleFile(file) {
-      applyToFiles([file], file.check === 'checked' ? 'unchecked' : 'checked')
+      applyToFiles([file], file.check !== 'checked')
     },
 
     toggleCurrentVersion() {
@@ -337,10 +369,9 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
       const repoId = selected.repoId
       const current = { ...inclusionsOf(repoId) }
       const existing = current[selected.path]
-      const allIncluded = existing !== undefined && existing.mode === 'all'
-      current[selected.path] = allIncluded
+      current[selected.path] = existing !== undefined && existing.mode === 'all'
         ? { mode: 'none' }
-        : { mode: 'partial', hunkKeys: diff.hunks.map(hunk => hunk.contentKey) }
+        : { mode: 'all' }
       setInclusions(repoId, current)
     },
 
@@ -351,16 +382,13 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
       const repoId = selected.repoId
       const current = { ...inclusionsOf(repoId) }
       const existing = current[selected.path]
-      const included = existing === undefined
+      const included = existing === undefined || existing.mode === 'all'
         ? new Set(diff.hunks.map(hunk => hunk.contentKey))
-        : existing.mode === 'all'
-          ? new Set(diff.hunks.map(hunk => hunk.contentKey))
-          : existing.mode === 'none'
-            ? new Set<string>()
-            : new Set(existing.hunkKeys)
+        : existing.mode === 'none'
+          ? new Set<string>()
+          : new Set(existing.hunkKeys)
       if (included.has(contentKey)) included.delete(contentKey)
       else included.add(contentKey)
-      // All hunks selected collapses back to `all`, which keeps the box's meaning obvious.
       current[selected.path] = included.size === diff.hunks.length
         ? { mode: 'all' }
         : included.size === 0
@@ -369,33 +397,11 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
       setInclusions(repoId, current)
     },
 
-    async revertHunk(contentKey) {
-      const selected = state.selected
-      const status = state.status
-      const repoId = state.activeRepoId
-      if (selected === null || status === null || repoId === null) return
-      try {
-        await api.rollback({
-          repoId,
-          expectedHeadOid: status.headOid,
-          confirmDeletePaths: true,
-          files: [{
-            path: selected.path,
-            ...(selected.origPath === null ? {} : { origPath: selected.origPath }),
-            status: selected.status,
-            partial: true,
-            hunkKeys: [contentKey],
-          }],
-        })
-        await refreshStatus()
-        await loadDiff(selected)
-      } catch (error) {
-        failBanner(error, 'diff.deleteHunk')
-      }
-    },
-
     setAmend(value) {
-      set({ amend: value })
+      // IntelliJ prefills the amended commit's own message; without this the host
+      // would commit the literal 'amend' when the box is empty.
+      const prefill = value && state.message.trim() === '' ? (state.status?.lastCommitMessage ?? '') : state.message
+      set({ amend: value, message: prefill })
     },
 
     setMessage(value) {
@@ -418,54 +424,97 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
       }
     },
 
-    async commit(push) {
+    requestCommit(push) {
+      if (state.busy !== null || state.pending !== null) return
+      set({ pending: { kind: 'commit', origin: 'commit', push }, banner: null })
+    },
+
+    requestRollback() {
+      if (state.busy !== null || state.pending !== null) return
+      set({ pending: { kind: 'rollback', origin: 'commit' }, banner: null })
+    },
+
+    requestRevertHunk(contentKey, path) {
+      if (state.busy !== null || state.pending !== null) return
+      set({ pending: { kind: 'revertHunk', origin: 'diff', contentKey, path }, banner: null })
+    },
+
+    async confirmPending() {
+      const pending = state.pending
       const repoId = state.activeRepoId
       const status = state.status
-      if (repoId === null || status === null) return
-      set({ busy: 'commit', banner: null })
+      if (pending === null || repoId === null || status === null) {
+        set({ pending: null })
+        return
+      }
+      const files = selectedInclusions(state, repoId)
+      set({ pending: null })
+      if (pending.kind === 'commit') {
+        set({ busy: 'commit', banner: null })
+        try {
+          const response: CommitResponse = await api.commit({
+            repoId,
+            expectedHeadOid: status.headOid,
+            message: state.message,
+            amend: state.amend,
+            files,
+            push: pending.push,
+          })
+          await refreshStatus()
+          if (response.headMovedDuringCommit) {
+            set({ busy: null, banner: { kind: 'error', key: 'commit.headMoved' } })
+            return
+          }
+          const sha = (response.commitSha ?? '').slice(0, 7)
+          if (!response.indexSynced) {
+            set({ busy: null, banner: { kind: 'error', key: 'commit.indexWarning', params: { reason: response.indexSyncError ?? '' } } })
+            return
+          }
+          if (pending.push && !response.pushed) {
+            const key: DshIntellijGitKey = response.pushErrorCode === 'NO_PUSH_TARGET' ? 'commit.pushNoTarget' : 'commit.pushFailed'
+            set({ busy: null, banner: { kind: 'error', key, params: { sha, hint: response.pushError ?? '', reason: response.pushError ?? '' } } })
+            return
+          }
+          set({ busy: null, message: '', amend: false, banner: { kind: 'notice', key: response.pushed ? 'commit.pushed' : 'commit.done', params: { sha } } })
+        } catch (error) {
+          failBanner(error, 'commit.button')
+        }
+        return
+      }
+
+      set({ busy: pending.kind === 'rollback' ? 'rollback' : 'revertHunk', banner: null })
       try {
-        const response: CommitResponse = await api.commit({
-          repoId,
-          expectedHeadOid: status.headOid,
-          message: state.message,
-          amend: state.amend,
-          files: selectedInclusions(state, repoId),
-          push,
-        })
-        await refreshStatus()
-        if (response.headMovedDuringCommit) {
-          set({ busy: null, banner: { kind: 'error', key: 'commit.headMoved' } })
+        if (pending.kind === 'rollback') {
+          const response = await api.rollback({ repoId, expectedHeadOid: status.headOid, files, confirmDeletePaths: true })
+          await refreshStatus()
+          set({ busy: null, diff: null, selected: null, banner: { kind: 'notice', key: 'rollback.done', params: { count: response.rolledBack.length } } })
           return
         }
-        const sha = (response.commitSha ?? '').slice(0, 7)
-        if (!response.indexSynced) {
-          set({ busy: null, banner: { kind: 'error', key: 'commit.indexWarning', params: { reason: response.indexSyncError ?? '' } } })
-          return
+        const selected = state.selected
+        if (selected !== null) {
+          await api.rollback({
+            repoId,
+            expectedHeadOid: status.headOid,
+            confirmDeletePaths: true,
+            files: [{
+              path: selected.path,
+              ...(selected.origPath === null ? {} : { origPath: selected.origPath }),
+              status: selected.status,
+              partial: true,
+              hunkKeys: [pending.contentKey],
+            }],
+          })
+          await refreshStatus()
+          await loadDiff(selected)
         }
-        if (push && !response.pushed) {
-          const key: DshIntellijGitKey = response.pushErrorCode === 'NO_PUSH_TARGET' ? 'commit.pushNoTarget' : 'commit.pushFailed'
-          set({ busy: null, banner: { kind: 'error', key, params: { sha, hint: response.pushError ?? '', reason: response.pushError ?? '' } } })
-          return
-        }
-        set({ busy: null, message: '', amend: false, banner: { kind: 'notice', key: response.pushed ? 'commit.pushed' : 'commit.done', params: { sha } } })
+        set({ busy: null })
       } catch (error) {
-        failBanner(error, 'commit.button')
+        failBanner(error, pending.kind === 'rollback' ? 'toolbar.rollback' : 'diff.deleteHunk')
       }
     },
 
-    async rollback() {
-      const repoId = state.activeRepoId
-      const status = state.status
-      if (repoId === null || status === null) return
-      set({ busy: 'rollback', banner: null })
-      try {
-        const files = selectedInclusions(state, repoId)
-        const response = await api.rollback({ repoId, expectedHeadOid: status.headOid, files, confirmDeletePaths: true })
-        await refreshStatus()
-        set({ busy: null, diff: null, selected: null, banner: { kind: 'notice', key: 'rollback.done', params: { count: response.rolledBack.length } } })
-      } catch (error) {
-        failBanner(error, 'rollback.title')
-      }
+    cancelPending() {
+      set({ pending: null })
     },
 
     dismissBanner() {
@@ -483,19 +532,22 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
   }
 }
 
+/** One inclusion as the wire expects it. */
+export interface WireInclusion {
+  readonly path: string
+  readonly origPath?: string
+  readonly status: FileChangeEntry['status'] | 'U'
+  readonly partial: boolean
+  readonly hunkKeys?: readonly string[]
+}
+
 /**
  * The inclusion set a commit or message request should carry.
  * @param state - current state.
  * @param repoId - active repository.
  * @returns the requested inclusions.
  */
-export function selectedInclusions(state: IntellijGitState, repoId: string): {
-  path: string,
-  origPath?: string,
-  status: FileChangeEntry['status'] | 'U',
-  partial: boolean,
-  hunkKeys?: string[],
-}[] {
+export function selectedInclusions(state: IntellijGitState, repoId: string): WireInclusion[] {
   const status = state.status
   if (status === null) return []
   const inclusions = state.inclusions[repoId] ?? {}
@@ -503,7 +555,7 @@ export function selectedInclusions(state: IntellijGitState, repoId: string): {
     ...status.changes.map(change => ({ path: change.path, ...(change.origPath === undefined ? {} : { origPath: change.origPath }), status: change.status })),
     ...status.unversioned.map(path => ({ path, status: 'U' as const })),
   ]
-  const result: ReturnType<typeof selectedInclusions> = []
+  const result: WireInclusion[] = []
   for (const entry of entries) {
     const inclusion = inclusions[entry.path]
     if (inclusion === undefined || inclusion.mode === 'none') continue
@@ -518,8 +570,27 @@ export function selectedInclusions(state: IntellijGitState, repoId: string): {
 }
 
 /**
+ * Paths the given inclusions will delete from disk.
+ * @param files - the requested inclusions.
+ * @returns the paths that are removed.
+ */
+export function deletionPaths(files: readonly WireInclusion[]): string[] {
+  return files.filter(file => willDeleteEntry(file.status, file.partial)).map(file => file.path)
+}
+
+/**
+ * Number of individually included hunks across a selection.
+ * @param files - the requested inclusions.
+ * @returns the hunk count.
+ */
+export function hunkCount(files: readonly WireInclusion[]): number {
+  return files.reduce((total, file) => total + (file.partial ? (file.hunkKeys?.length ?? 0) : 0), 0)
+}
+
+/**
  * Build the two groups the Commit tree renders.
  * @param state - current state.
+ * @param repoId - active repository.
  * @returns the groups, or null while no status is loaded.
  */
 export function groupsOf(state: IntellijGitState, repoId: string): { changes: GroupNode, unversioned: GroupNode } | null {

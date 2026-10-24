@@ -21,6 +21,7 @@ import { join } from 'node:path'
 import type {
   CommitRequest,
   CommitResponse,
+  DiffHunk,
   FileChangeEntry,
   FileInclusionRequest,
   RollbackRequest,
@@ -163,6 +164,13 @@ async function stageFile(repoRoot: string, indexFile: string, file: FileInclusio
 
   const keys = file.hunkKeys ?? []
   if (keys.length === 0) return
+  // A new file carries exactly one hunk, and `git apply --cached` cannot consume a
+  // creation patch built from `/dev/null` (`error: dev/null: does not exist in
+  // index`). Staging the whole file is the same commit and the only thing that works.
+  if (status === 'U' || status === 'A') {
+    await runGitWithIndex({ cwd: repoRoot, args: ['update-index', '--add', '--remove', '--', file.path], timeoutMs }, indexFile)
+    return
+  }
   const diff = await readFileDiff({
     repoRoot,
     path: file.path,
@@ -178,7 +186,7 @@ async function stageFile(repoRoot: string, indexFile: string, file: FileInclusio
       details: { path: file.path, missing: keys.filter(key => !wanted.some(hunk => hunk.contentKey === key)) },
     })
   }
-  const kind = status === 'U' || status === 'A' ? 'new' : status === 'D' ? 'delete' : 'edit'
+  const kind = status === 'D' ? 'delete' : 'edit'
   await runGitWithIndex({
     cwd: repoRoot,
     args: ['apply', '--cached', '--unidiff-zero', '-'],
@@ -315,47 +323,26 @@ export async function rollbackRepo(options: {
   const { repoRoot, request, timeoutMs } = options
   await requireHead(repoRoot, request.expectedHeadOid, timeoutMs)
   const headOid = await currentHeadOid(repoRoot, timeoutMs)
+  const prepared = await preflightRollback(repoRoot, request, timeoutMs)
   const done: string[] = []
 
   for (const file of request.files) {
+    const absolute = resolveRepoFile(repoRoot, file.path)
+    if (willDelete(file)) {
+      // U and A carry no committed content, so removing them from disk IS the revert.
+      await runGit({ cwd: repoRoot, args: ['rm', '--cached', '-q', '-f', '--', file.path], timeoutMs, allowExitCodes: [0, 1, 128] })
+      await unlink(absolute).catch(() => undefined)
+      done.push(file.path)
+      continue
+    }
     if (file.partial) {
-      const keys = file.hunkKeys ?? []
-      if (keys.length === 0) continue
-      const diff = await readFileDiff({ repoRoot, path: file.path, origPath: file.origPath ?? null, status: file.status, timeoutMs })
-      const wanted = diff.hunks.filter(hunk => keys.includes(hunk.contentKey))
-      if (wanted.length !== keys.length) {
-        throw new ApiHttpError(409, { code: 'STALE_HUNKS', message: 'the file changed on disk since this diff was loaded; refresh and try again' })
-      }
+      const hunks = prepared.get(file.path) ?? []
       await runGit({
         cwd: repoRoot,
         args: ['apply', '--reverse', '--unidiff-zero', '-'],
         timeoutMs,
-        input: buildPatch(file.path, wanted, file.status === 'A' || file.status === 'U' ? 'new' : 'edit'),
+        input: buildPatch(file.path, hunks, 'edit'),
       })
-      done.push(file.path)
-      continue
-    }
-
-    const absolute = resolveRepoFile(repoRoot, file.path)
-    const status: FileChangeEntry['status'] | 'U' = file.status
-    if (status === 'U') {
-      requireDeleteConfirmation(request.confirmDeletePaths, file.path)
-      await unlink(absolute)
-      done.push(file.path)
-      continue
-    }
-    if (status === 'A') {
-      requireDeleteConfirmation(request.confirmDeletePaths, file.path)
-      await runGit({ cwd: repoRoot, args: ['rm', '--cached', '-q', '--', file.path], timeoutMs, allowExitCodes: [0, 1, 128] })
-      await unlink(absolute).catch(() => undefined)
-      done.push(file.path)
-      continue
-    }
-    if (status === 'R' && file.origPath !== undefined && file.origPath !== '') {
-      requireDeleteConfirmation(request.confirmDeletePaths, file.path)
-      await runGit({ cwd: repoRoot, args: ['checkout', 'HEAD', '--', file.origPath], timeoutMs })
-      await runGit({ cwd: repoRoot, args: ['rm', '--cached', '-q', '--', file.path], timeoutMs, allowExitCodes: [0, 1, 128] })
-      await unlink(absolute).catch(() => undefined)
       done.push(file.path)
       continue
     }
@@ -369,6 +356,61 @@ export async function rollbackRepo(options: {
   }
 
   return { rolledBack: done, headOid }
+}
+
+/**
+ * Whether reverting this entry removes the file from disk.
+ *
+ * One predicate, shared by the browser copy and this pre-pass, so the dialog can
+ * never promise "nothing is deleted" while a file disappears. `U` and `A` have no
+ * committed content, so any revert of them is a delete, partial or not. `R` is a
+ * delete only as a whole-file change: a partial `R` is reverse-applied as an edit,
+ * so its file survives.
+ * @param file - the requested inclusion.
+ * @returns true when the revert deletes the path.
+ */
+export function willDelete(file: FileInclusionRequest): boolean {
+  return file.status === 'U' || file.status === 'A' || (file.status === 'R' && !file.partial)
+}
+
+/** What a rollback needs from its pre-pass, keyed by path. */
+type PreparedRollback = ReadonlyMap<string, readonly DiffHunk[]>
+
+/**
+ * Validate the whole rollback before touching anything.
+ *
+ * Both refusals are all-or-nothing: a request that needs a deletion the caller did
+ * not confirm, or whose selected hunks no longer match the file, must leave the
+ * working tree and the index exactly as they were. Validating per entry inside the
+ * mutation loop would half-apply the rollback.
+ * @param repoRoot - absolute repository root.
+ * @param request - the rollback body.
+ * @param timeoutMs - deadline of each call.
+ * @returns the hunks to reverse-apply, per path.
+ */
+async function preflightRollback(repoRoot: string, request: RollbackRequest, timeoutMs: number): Promise<PreparedRollback> {
+  const deletions = request.files.filter(willDelete)
+  if (deletions.length > 0 && !request.confirmDeletePaths) {
+    throw new ApiHttpError(400, {
+      code: 'DELETE_CONFIRMATION_REQUIRED',
+      message: 'rolling back these paths deletes them from disk; confirm the deletion first',
+      details: { paths: deletions.map(file => file.path) },
+    })
+  }
+
+  const prepared = new Map<string, readonly DiffHunk[]>()
+  for (const file of request.files) {
+    if (!file.partial || willDelete(file)) continue
+    const keys = file.hunkKeys ?? []
+    if (keys.length === 0) continue
+    const diff = await readFileDiff({ repoRoot, path: file.path, origPath: file.origPath ?? null, status: file.status, timeoutMs })
+    const wanted = diff.hunks.filter(hunk => keys.includes(hunk.contentKey))
+    if (wanted.length !== keys.length) {
+      throw new ApiHttpError(409, { code: 'STALE_HUNKS', message: 'the file changed on disk since this diff was loaded; refresh and try again' })
+    }
+    prepared.set(file.path, wanted)
+  }
+  return prepared
 }
 
 /**
