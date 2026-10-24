@@ -1,0 +1,29 @@
+# Bundle patch for dsh-intellij-git.
+#
+# The DSH profile applies every installed bundle's patch on top of the profile
+# tree, so this file is the whole installation contract: one `insert` row keyed
+# by the package id.
+#
+# `aweaveRoot` ships EMPTY on purpose. A public plugin must not default into a
+# machine-specific path; empty means "derive it", by walking up from the Host
+# process working directory for the platform marker
+# `workspaces/devtools/common/server/package.json` (the same rule
+# aweave-dsh-devkit uses). A deployment whose Host starts outside the tree sets
+# the absolute path in its own profile patch (an id-keyed row; `config` is
+# assigned shallowly, so the row states the complete object):
+#
+#   - id: dsh-intellij-git
+#     name: dsh-intellij-git
+#     config:
+#       aweaveRoot: /absolute/path/to/aweave
+#       gitTimeoutMs: 30000
+#       llmProvider: ''
+#       llmModel: ''
+- insert:
+    - id: dsh-intellij-git
+      name: dsh-intellij-git
+      config:
+        aweaveRoot: ''
+        gitTimeoutMs: 30000
+        llmProvider: ''
+        llmModel: ''

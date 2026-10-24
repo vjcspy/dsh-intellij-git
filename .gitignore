@@ -1,0 +1,4 @@
+node_modules/
+# Anchored: an unanchored lib/ matches at every depth and would swallow src/**/lib/.
+/lib/
+*.tsbuildinfo
