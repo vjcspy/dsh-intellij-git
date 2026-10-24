@@ -1,49 +1,45 @@
 /**
- * Browser half: register the Commit and Diff tab kinds, their bodies, their
- * copy and their stylesheet, and open the diff beside the commit tree.
+ * Browser half: register the Git page in the main column, its row in the left
+ * sidebar directly under `Plugins`, its copy and its stylesheet.
  *
- * One store instance is created here and injected into both bodies, so the
- * inclusion map is literally the same object in the tree and in the viewer.
+ * One store is created here and injected into the page, so the inclusion map is
+ * literally the same object in the tree and in the viewer. The store lives in
+ * `apply`, so its state survives the page unmounting; only the watcher follows
+ * the page (`setPageActive`), so `git status` runs every 5 s only while someone
+ * can see the result.
  *
- * `sidebarRight` is read through a scoped `ctx.inject` rather than declared
- * top-level: its absence then only disables opening the diff pane, instead of
- * unloading the whole tab.
+ * `layout` is read through a scoped `ctx.inject`, as `dshmarket` does: its
+ * absence then only disables the tidy-up on teardown, instead of unloading the
+ * whole page.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 // Type-only: declares the `locale` member this half reads.
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: declares the `slots` member this half registers into.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-// Type-only: declares `sidebarRightTabs` and `sidebarRight`.
-import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
+// Type-only: the root `main` keyed slot and its panel id brand, and the
+// `sidebar.panellist` list the row registers into.
+import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 
-import {
-  COMMIT_TAB_ID,
-  COMMIT_TAB_KIND,
-  DIFF_TAB_ID,
-  DIFF_TAB_KIND,
-  GUIDE_ENTRY_ID,
-  GUIDE_ENTRY_ORDER,
-  LOCALE_NAMESPACE,
-} from '../config.ts'
-import { CommitTabBody } from './CommitTabBody.tsx'
-import { DiffTabBody } from './DiffTabBody.tsx'
+import { LOCALE_NAMESPACE, PAGE_ID, PAGE_ROW_ORDER } from '../config.ts'
+import { GitPage } from './GitPage.tsx'
 import { en } from './locale.ts'
+import { NavIcon } from './NavIcon.tsx'
 import { createIntellijGitStore } from './store.ts'
 import { installStyles } from './styles.ts'
 
 /** Services this half always needs; all shell-provided. */
-export const inject = ['slots', 'locale', 'sidebarRightTabs']
+export const inject = ['slots', 'locale']
 
-/** The slice of the right-sidebar controller this half calls. */
-interface SidebarLike {
-  tabsIn(sessionId: string): readonly { id: string, kind: string }[]
-  focus(tabId: string): void
-  openTabIn(sessionId: string, kind: string, options?: { preferNewPane?: boolean }): void
+/** The slice of the layout service this half calls. */
+interface LayoutLike {
+  selectPanel(panelId: MainPanelId | null): void
+  panelInfo: { getSnapshot(): { activePanelId?: string | null } }
 }
 
 /**
- * Register the tab kinds, dictionaries, stylesheet and bodies.
+ * Register the page, the sidebar row, the dictionaries and the stylesheet.
  * @param ctx - browser-side plugin context owning the registry and the seats.
  */
 export function apply(ctx: ClientContext): void {
@@ -51,69 +47,47 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(LOCALE_NAMESPACE, 'en', en), 'dsh-intellij-git: dictionaries')
   installStyles(ctx)
 
-  let sidebar: SidebarLike | undefined
+  const store = createIntellijGitStore()
 
-  const store = createIntellijGitStore({
-    openDiffTab: (sessionId) => {
-      if (sidebar === undefined || sessionId === undefined) return
-      // Search every pane before opening: dedupe is per pane, so a second open
-      // would otherwise create a duplicate viewer in a sibling pane.
-      const existing = sidebar.tabsIn(sessionId).find(tab => tab.kind === DIFF_TAB_KIND)
-      if (existing !== undefined) {
-        sidebar.focus(existing.id)
-        return
-      }
-      sidebar.openTabIn(sessionId, DIFF_TAB_KIND, { preferNewPane: true })
-    },
-  })
-
-  // The tab body is `keepMounted`, so the store starts its own load and its own
-  // poll once: a freshly opened tab is populated without a click, and the watcher
-  // has an active repository to probe.
+  // The first load runs once, here; the watcher belongs to the page and is
+  // stopped when this plugin goes away so a reload never leaves a timer behind.
   ctx.effect(() => {
     void store.actions.bootstrap()
-    return store.actions.startWatch()
-  }, 'dsh-intellij-git: bootstrap and live change list')
+    return () => { store.actions.setPageActive(false) }
+  }, 'dsh-intellij-git: bootstrap and watcher teardown')
 
-  ctx.effect(() => ctx.sidebarRightTabs.register({
-    id: COMMIT_TAB_ID,
-    kind: COMMIT_TAB_KIND,
-    keepMounted: true,
-    title: () => t('tab.title'),
-    guide: [{
-      id: GUIDE_ENTRY_ID,
-      order: GUIDE_ENTRY_ORDER,
-      title: () => t('guide.title'),
-      description: () => t('guide.description'),
-    }],
-  }), 'dsh-intellij-git: commit tab kind')
-
-  ctx.effect(() => ctx.sidebarRightTabs.register({
-    id: DIFF_TAB_ID,
-    kind: DIFF_TAB_KIND,
-    keepMounted: false,
-    title: () => t('diff.titleEmpty'),
-  }), 'dsh-intellij-git: diff tab kind')
-
-  // Optional service: absent means the diff opens in place instead of beside.
+  let layout: LayoutLike | undefined
   const bind = ctx as unknown as { inject: (names: string[], callback: (inner: unknown) => void) => unknown }
-  bind.inject(['sidebarRight'], (inner) => {
-    const scoped = inner as ClientContext & { sidebarRight: SidebarLike }
-    sidebar = scoped.sidebarRight
-    scoped.effect(() => () => { sidebar = undefined }, 'dsh-intellij-git: sidebar service')
+  bind.inject(['layout'], (inner) => {
+    const scoped = inner as ClientContext & { layout: LayoutLike }
+    layout = scoped.layout
+    scoped.effect(() => () => { layout = undefined }, 'dsh-intellij-git: layout service')
   })
 
-  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
-    name: 'sidebar.right.pane.tab',
-    key: COMMIT_TAB_ID,
-    locale: LOCALE_NAMESPACE,
-    inject: () => ({ store }),
-  }, CommitTabBody)), 'dsh-intellij-git: commit tab body')
+  const panelId = PAGE_ID as MainPanelId
 
-  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
-    name: 'sidebar.right.pane.tab',
-    key: DIFF_TAB_ID,
+  ctx.effect(() => ctx.slots.inject('main', () => {
+    const dispose = ctx.slots.register({
+      name: 'main',
+      key: panelId,
+      locale: LOCALE_NAMESPACE,
+      inject: () => ({ store }),
+    }, GitPage)
+    return () => {
+      // Leave the page before its panel goes: a selection pointing at a key that
+      // no longer exists would strand the main column on nothing.
+      if (layout?.panelInfo.getSnapshot().activePanelId === PAGE_ID) layout.selectPanel(null)
+      dispose()
+    }
+  }), 'dsh-intellij-git: main page')
+
+  // `order: 0.5` is directly under `Plugins` (0) whether or not the optional
+  // market row (1) is enabled.
+  ctx.effect(() => ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+    name: 'sidebar.panellist',
+    id: panelId,
+    order: PAGE_ROW_ORDER,
+    label: () => t('nav.label'),
     locale: LOCALE_NAMESPACE,
-    inject: () => ({ store }),
-  }, DiffTabBody)), 'dsh-intellij-git: diff tab body')
+  }, NavIcon)), 'dsh-intellij-git: sidebar row')
 }

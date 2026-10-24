@@ -1,5 +1,5 @@
 /**
- * Copy dictionary for the Git Commit tool window and the diff viewer.
+ * Copy dictionary for the Git main-area page: changes, commit box, diff viewer and activity dock.
  *
  * Every product-visible string, including every tooltip and every confirmation
  * sentence, lives here and reaches a component through the `t` seat.
@@ -10,18 +10,33 @@ import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
-    /** Git Commit tab title, guide entry, tree, commit box, diff viewer, tooltips and dialogs. */
+    /** Git page: nav row, header, tree, commit box, diff viewer, activity dock, tooltips and dialogs. */
     dshIntellijGit: DshIntellijGitKey
   }
 }
 
 /** English dictionary, and the namespace's key-set source of truth. */
 export const en = {
-  'tab.title': 'Git Commit',
-  'guide.title': 'Git Commit',
-  'guide.description': 'IntelliJ-style commit and diff for the platform root and every workspace repository',
-
-  'diff.titleEmpty': 'Diff',
+  'nav.label': 'Git',
+  'page.title': 'Git',
+  'page.changes': 'Changes',
+  'page.diff': 'Diff',
+  'splitter.columns': 'Resize the changes and diff columns',
+  'splitter.dock': 'Resize the activity dock',
+  'bar.label': 'Working',
+  'busy.wait': 'Wait for {phase} to finish',
+  'phase.commit': 'Committing...',
+  'phase.commitPush': 'Committing and pushing...',
+  'phase.push': 'Pushing to {target}...',
+  'phase.rebase': 'Rebasing onto {target}...',
+  'phase.merge': 'Merging {target}...',
+  'phase.rollback': 'Rolling back {count} files...',
+  'phase.revertHunk': 'Reverting hunk...',
+  'phase.elapsed': '{phase} {seconds}s',
+  'toast.copySha': 'Copy SHA',
+  'push.done': 'Pushed {sha}',
+  'state.retry': 'Retry',
+  'state.retry.tip': 'Load the change list again',
 
   'toolbar.refresh': 'Refresh',
   'toolbar.refresh.tip': 'Reload the change list of the open repository from disk',
@@ -67,6 +82,7 @@ export const en = {
   'commit.generate.tip': 'Write a message from the ticked changes with the model that runs this Session',
   'commit.generate.disabled.tip': 'Tick at least one change first',
   'commit.generating': 'Generating',
+  'commit.generateFailed': 'Could not generate a message: {reason}',
   'commit.aiRoute': 'via {provider}/{model}',
   'commit.button': 'Commit',
   'commit.button.tip': 'Commit the ticked changes. Asks before writing',
@@ -120,6 +136,20 @@ export const en = {
   'activity.clear.tip': 'Drop every recorded entry from the Host buffer',
   'activity.kind.api': 'API',
   'activity.kind.git': 'git',
+  'activity.summary': '{requests} requests, {entries} entries',
+  'activity.running': 'running',
+  'activity.auto': 'auto',
+  'activity.calls': '{count} git calls',
+  'activity.partial': 'partial: older entries evicted',
+  'activity.stale': 'Could not refresh',
+  'activity.unread': 'New activity',
+  'activity.clearing': 'Clearing',
+  'activity.clearFailed': 'Clear failed: {reason}',
+  'activity.background': 'Show background',
+  'activity.background.count': 'Show background ({count})',
+  'activity.background.tip': 'Also list the requests the 5 s watcher made on its own',
+  'activity.copy': 'Copy',
+  'activity.copy.tip': 'Copy this output',
   'activity.toggle.tip': 'Show or hide the activity panel',
   'activity.ok': 'ok',
   'activity.error': 'failed',
@@ -144,6 +174,7 @@ export const en = {
   'sync.merge': 'Merge and push',
   'sync.merge.tip': 'Record a merge commit that joins {target} into {branch}; nothing is rewritten',
   'sync.cancel': 'Cancel',
+  'sync.cancel.busy.tip': 'git cannot be interrupted safely mid-integration',
   'sync.done': 'Integrated by {mode} and pushed {sha}',
   'sync.conflict': 'The {mode} hit a conflict, so it was aborted and the commit kept. Resolve these paths by hand: {paths}',
   'sync.dirty': 'This repository has changes in the way. {reason} {paths}',
@@ -164,6 +195,11 @@ export const en = {
   'diff.toolbar.split.tip': 'Compare old and new in two columns',
   'diff.toolbar.unified': 'Unified',
   'diff.toolbar.unified.tip': 'Compare old and new in one column',
+  'diff.toolbar.mode': 'Diff layout',
+  'diff.toolbar.wrap': 'Wrap lines',
+  'diff.toolbar.wrap.tip': 'Wrap long lines instead of scrolling sideways',
+  'diff.fold': '... {count} unchanged lines',
+  'diff.gap': '... {count} lines not in this diff',
   'diff.toolbar.collapse': 'Collapse unchanged fragments',
   'diff.toolbar.collapse.tip': 'Hide unchanged lines that are not next to a change',
   'diff.summary': '{total} differences, {included} included',

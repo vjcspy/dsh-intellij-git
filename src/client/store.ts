@@ -17,6 +17,7 @@
  *    only reads state never sets it.
  */
 import {
+  ACTIVITY_CAPACITY,
   ROOT_REPO_ID,
   WATCH_INTERVAL_MS,
   type ActivityEntry,
@@ -30,7 +31,8 @@ import {
   type SyncResponse,
   type WorkspaceTreeResponse,
 } from '../config.ts'
-import { ApiError, api } from './api.ts'
+import { ApiError, createApi } from './api.ts'
+import { readPref, writePref } from './layout-prefs.ts'
 import { buildGroups, dirKeysOf, filesOf, type DirNode, type GroupNode, type FileNode } from './tree-builder.ts'
 import type { DshIntellijGitKey } from './locale.ts'
 
@@ -39,6 +41,16 @@ export interface Banner {
   readonly kind: 'error' | 'notice'
   readonly key: DshIntellijGitKey
   readonly params?: Record<string, unknown>
+}
+
+/** A transient success the page shows as a toast. */
+export interface ToastState {
+  readonly key: DshIntellijGitKey
+  readonly params?: Record<string, unknown>
+  /** Epoch ms; also the React key, so a repeat of the same text restarts the toast. */
+  readonly at: number
+  /** Full commit SHA or short SHA offered by the toast's copy action. */
+  readonly sha?: string
 }
 
 /** The file the diff viewer is showing. */
@@ -56,6 +68,21 @@ export type PendingAction =
   | { readonly kind: 'revertHunk', readonly origin: 'diff', readonly contentKey: string, readonly path: string }
   | { readonly kind: 'push', readonly origin: 'commit' }
 
+/** Which write is running. */
+export type BusyKind = 'commit' | 'commitPush' | 'push' | 'rebase' | 'merge' | 'rollback' | 'revertHunk'
+
+/** The write that owns the page's locks. Only its own completion releases it. */
+export interface BusyState {
+  /** Monotonic operation id; a release is honoured only when it still matches. */
+  readonly opId: number
+  readonly kind: BusyKind
+  /** The repository the write captured; the repository row lock keeps it active. */
+  readonly repoId: string
+  readonly startedAt: number
+  /** Copy parameters of the phase label (target, count). */
+  readonly params?: Record<string, unknown>
+}
+
 /** The rejected push the tool window is offering to resolve. */
 export interface SyncOffer {
   /** Resolved push target the integration would run against. */
@@ -63,7 +90,7 @@ export interface SyncOffer {
   readonly branch: string
 }
 
-/** Everything the two tabs render from. */
+/** Everything the page renders from. */
 export interface IntellijGitState {
   readonly tree: WorkspaceTreeResponse | null
   readonly treeLoading: boolean
@@ -81,6 +108,8 @@ export interface IntellijGitState {
   readonly lastCheckedAt: number | null
   /** True while the digest probe is failing; never raises a banner. */
   readonly watchFailing: boolean
+  /** True while the main-area page is mounted; the watcher runs only then. */
+  readonly pageActive: boolean
   /** Directories the Human collapsed, keyed `<repoId>:<group>:<path>`. Expanded is the absence of a key. */
   readonly collapsedNodes: readonly string[]
   readonly inclusions: Readonly<Record<string, Readonly<Record<string, FileInclusion>>>>
@@ -90,26 +119,49 @@ export interface IntellijGitState {
   readonly diffError: string | null
   readonly viewMode: 'split' | 'unified'
   readonly collapseUnchanged: boolean
+  readonly wrapLines: boolean
   readonly compactFolders: boolean
   readonly amend: boolean
   readonly message: string
   readonly aiBusy: boolean
   readonly aiRoute: string | null
-  readonly busy: 'commit' | 'rollback' | 'revertHunk' | 'sync' | null
+  /** Failure of the last message generation; touches nothing else. */
+  readonly aiError: string | null
+  readonly busy: BusyState | null
   readonly pending: PendingAction | null
+  /** Persistent write error, rendered in the page header region. */
   readonly banner: Banner | null
-  /** Host-side activity buffer, newest last. */
+  /** Transient success. */
+  readonly toast: ToastState | null
+  /** Host-side activity buffer, merged client-side, oldest first. */
   readonly activity: readonly ActivityEntry[]
+  /** Ring identity of the last read; a change means the host restarted. */
+  readonly activityBootId: string | null
+  /** Highest entry id merged so far; the `after` cursor of the next read. */
+  readonly activityLastSeenId: number
+  /** True when entries older than the first retained one were evicted or cleared. */
+  readonly activityTruncated: boolean
   readonly activityOpen: boolean
   /** Ids of the entries whose captured output is expanded. */
   readonly activityDetail: readonly number[]
+  /** Keys of the request groups whose git calls are expanded. */
+  readonly activityGroupsOpen: readonly string[]
+  /** Whether watcher-driven groups are listed. */
+  readonly showBackground: boolean
+  /** A group appeared while the dock was collapsed. */
+  readonly activityUnread: boolean
+  readonly activityClearing: boolean
+  /** The last dock read failed; the list may lag the host. */
+  readonly activityStale: boolean
+  /** The last Clear failed. */
+  readonly activityError: string | null
   /** Non-null while a rejected push is waiting for the Human to choose an order. */
   readonly syncOffer: SyncOffer | null
 }
 
 /** Everything the store can do. */
 export interface IntellijGitActions {
-  /** Load the tree, the root repository's status and the activity list once, on open. */
+  /** Load the tree, the root repository's status and the activity list once. */
   bootstrap(): Promise<void>
   refreshTree(): Promise<void>
   /** Reload the tree, the open repository's status and the open diff. */
@@ -121,16 +173,24 @@ export interface IntellijGitActions {
   toggleDir(key: string): void
   collapseAllDirs(): void
   expandAllDirs(): void
-  refreshStatus(): Promise<void>
   /**
-   * Start the digest poll and the visibility/focus refresh.
-   * @returns the disposer that stops both.
+   * Reload one repository's status.
+   * @param repoId - defaults to the active repository.
+   * @param origin - `auto` marks a watcher-driven call.
+   * @returns the status that was applied, or null when the call failed or was superseded.
    */
-  startWatch(): () => void
-  openFile(sessionId: string | undefined, file: SelectedFile): Promise<void>
+  refreshStatus(repoId?: string, origin?: 'user' | 'auto'): Promise<RepoStatusResponse | null>
+  /**
+   * Tell the store whether the main-area page is mounted. The watcher (the 5 s
+   * digest poll plus the visibility/focus refresh) runs only while it is.
+   * Activation runs one immediate status refresh.
+   */
+  setPageActive(active: boolean): void
+  openFile(file: SelectedFile): Promise<void>
   refreshDiff(): Promise<void>
   setViewMode(mode: 'split' | 'unified'): void
   toggleCollapse(): void
+  toggleWrap(): void
   toggleCompact(): void
   toggleGroup(group: GroupNode): void
   toggleNode(node: FileNode | DirNode | GroupNode): void
@@ -156,11 +216,15 @@ export interface IntellijGitActions {
   sync(mode: SyncMode): Promise<void>
   /** Dismiss the push offer without integrating. */
   dismissSyncOffer(): void
+  /** Request a full snapshot read of the host buffer (the dock's Refresh button). */
   refreshActivity(): Promise<void>
   clearActivity(): Promise<void>
   toggleActivity(): void
   toggleActivityDetail(id: number): void
+  toggleActivityGroup(key: string): void
+  toggleShowBackground(): void
   dismissBanner(): void
+  dismissToast(): void
 }
 
 /** Handle the store exposes to the view layer. */
@@ -170,11 +234,11 @@ export interface IntellijGitStore {
   readonly actions: IntellijGitActions
 }
 
-/** What the store needs from the plugin body. */
-export interface StoreOptions {
-  /** Open or focus the diff tab for the Session on screen. */
-  readonly openDiffTab: (sessionId: string | undefined) => void
-}
+/** The outcome of one diff load. */
+type DiffOutcome =
+  | { readonly kind: 'current', readonly diff: FileDiffResponse }
+  | { readonly kind: 'failed' }
+  | { readonly kind: 'superseded' }
 
 /**
  * Whether reverting this entry deletes the file from disk.
@@ -192,11 +256,10 @@ export function willDeleteEntry(status: FileChangeEntry['status'] | 'U', partial
 }
 
 /**
- * Create the Commit tool window store.
- * @param options - the diff-tab callback owned by `apply`.
+ * Create the Git page store.
  * @returns the store handle.
  */
-export function createIntellijGitStore(options: StoreOptions): IntellijGitStore {
+export function createIntellijGitStore(): IntellijGitStore {
   let state: IntellijGitState = {
     tree: null,
     treeLoading: false,
@@ -211,25 +274,38 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     statusError: null,
     lastCheckedAt: null,
     watchFailing: false,
+    pageActive: false,
     collapsedNodes: [],
     inclusions: {},
     selected: null,
     diff: null,
     diffLoading: false,
     diffError: null,
-    viewMode: 'split',
-    collapseUnchanged: true,
+    viewMode: readPref<'split' | 'unified'>('viewMode', 'split', value => value === 'split' || value === 'unified'),
+    collapseUnchanged: readPref('collapseUnchanged', true),
+    wrapLines: readPref('wrap', false),
     compactFolders: true,
     amend: false,
     message: '',
     aiBusy: false,
     aiRoute: null,
+    aiError: null,
     busy: null,
     pending: null,
     banner: null,
+    toast: null,
     activity: [],
-    activityOpen: true,
+    activityBootId: null,
+    activityLastSeenId: 0,
+    activityTruncated: false,
+    activityOpen: readPref('dockOpen', true),
     activityDetail: [],
+    activityGroupsOpen: [],
+    showBackground: readPref('showBackground', false),
+    activityUnread: false,
+    activityClearing: false,
+    activityStale: false,
+    activityError: null,
     syncOffer: null,
   }
   const listeners = new Set<() => void>()
@@ -237,14 +313,26 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
   /**
    * Monotonic token of the latest status request.
    *
-   * The watcher introduces a second writer of `status` on a 5 s cadence, so a
-   * tick can land after the post-commit refresh and reinstate the stale list, or
-   * land after the accordion moved and paint repository A's files under B. A
-   * response is applied only while its token is the latest and its repository is
-   * still the active one; the host's `HEAD` compare-and-swap protects writes, not
-   * the view.
+   * The watcher is a second writer of `status`, so a tick can land after the
+   * post-commit refresh and reinstate the stale list, or land after the accordion
+   * moved and paint repository A's files under B. A response is applied only
+   * while its token is the latest and its repository is still the active one.
    */
   let statusRequestSeq = 0
+
+  /**
+   * Monotonic token of the latest diff request. Incremented by every `loadDiff`,
+   * by every selection clear and by every repository switch, so a response that
+   * resolves after a newer one (or after the selection moved) is `superseded` and
+   * neither published nor used for any derived mutation.
+   */
+  let diffRequestSeq = 0
+
+  /** Operation ids of writes; see {@link BusyState}. */
+  let opSeq = 0
+
+  /** Bumped by every message edit, a commit's message reset and a repository switch. */
+  let draftGeneration = 0
 
   /**
    * Publish a state patch.
@@ -256,13 +344,51 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
   }
 
   /**
-   * Turn a thrown error into a banner.
-   * @param error - the failure.
-   * @param key - fallback dictionary key.
+   * The single route surface. Every non-silent call settles into the activity
+   * refresh, so no call site has to remember it.
    */
-  const failBanner = (error: unknown, key: DshIntellijGitKey): void => {
-    const detail = error instanceof ApiError ? error.message : error instanceof Error ? error.message : String(error)
-    set({ banner: { kind: 'error', key, params: { reason: detail } }, busy: null, pending: null, statusLoading: false, diffLoading: false, aiBusy: false })
+  const api = createApi({ onSettled: () => { void scheduleActivityRefresh() } })
+
+  /**
+   * Take the page's write lock for one write.
+   * @param kind - which write.
+   * @param repoId - the repository it captured.
+   * @param params - copy parameters of its phase label.
+   * @returns the operation id its completion must present.
+   */
+  const beginOp = (kind: BusyKind, repoId: string, params?: Record<string, unknown>): number => {
+    opSeq += 1
+    const opId = opSeq
+    set({
+      busy: { opId, kind, repoId, startedAt: Date.now(), ...(params === undefined ? {} : { params }) },
+      banner: null,
+      toast: null,
+    })
+    return opId
+  }
+
+  /**
+   * Release the lock and publish the write's outcome in one update.
+   *
+   * Only the owning operation releases: an unrelated failure (Clear, AI) never
+   * reaches this, and a completion whose id no longer matches publishes its
+   * patch without touching `busy`.
+   * @param opId - the id from `beginOp`.
+   * @param patch - the outcome (banner, toast, offer, resets).
+   */
+  const finishOp = (opId: number, patch: Partial<IntellijGitState> = {}): void => {
+    set(state.busy?.opId === opId ? { ...patch, busy: null } : patch)
+  }
+
+  /**
+   * Describe a thrown error for a banner.
+   * @param error - the failure.
+   * @param key - dictionary key naming what failed.
+   * @returns the banner patch; it touches nothing but the banner.
+   */
+  const errorBanner = (error: unknown, key: DshIntellijGitKey): Partial<IntellijGitState> => {
+    const detail = error instanceof Error ? error.message : String(error)
+    return { banner: { kind: 'error', key, params: { reason: detail } } }
   }
 
   /**
@@ -370,87 +496,139 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     return status.changes.some(entry => entry.path === path) || status.unversioned.includes(path)
   }
 
+
   /**
-   * Recover from a `409 STALE_HUNKS` answer where it actually bites.
+   * Prune and report a `409 STALE_HUNKS` answer where it actually bites.
    *
    * The host already names the path and the dead keys, but they may belong to a
    * file that is not the selected one, and a 409 means the post-commit drop never
-   * ran - so the fix is to prune that path's inclusion and say which path it was,
-   * not to re-read the wrong file.
+   * ran: prune that path's inclusion and say which path it was.
    * @param error - the thrown failure.
-   * @param repoId - the active repository.
-   * @param fallback - the banner key to use when the answer carries no path.
-   * @returns true when the error was a stale-hunk answer and is now handled.
+   * @param repoId - the repository the write captured.
+   * @returns the banner patch when the error was a stale-hunk answer, else null.
    */
-  const handleStaleHunks = (error: unknown, repoId: string, fallback: DshIntellijGitKey): boolean => {
-    if (!(error instanceof ApiError) || error.code !== 'STALE_HUNKS') return false
+  const staleHunksPatch = (error: unknown, repoId: string): Partial<IntellijGitState> | null => {
+    if (!(error instanceof ApiError) || error.code !== 'STALE_HUNKS') return null
     const path = typeof error.details?.['path'] === 'string' ? error.details['path'] : ''
-    if (path === '') {
-      failBanner(error, fallback)
-      return true
-    }
+    if (path === '') return null
     const rawMissing = error.details?.['missing']
     const missing = Array.isArray(rawMissing) ? rawMissing.filter((key): key is string => typeof key === 'string') : []
     pruneStaleHunks(repoId, path, missing)
-    set({ busy: null, banner: { kind: 'error', key: 'commit.stalePruned', params: { path } } })
-    return true
+    return { banner: { kind: 'error', key: 'commit.stalePruned', params: { path } } }
   }
 
+  // ---------------------------------------------------------------- activity
+
   /**
-   * Load the selected repository's status.
-   *
-   * Sequenced: the token and the repository are captured before the call and
-   * re-checked after it, so a slow tick can neither overwrite a newer status nor
-   * paint one repository's list under another.
+   * Bumped by Clear at entry; a read that started earlier is dropped on publish.
    */
-  const refreshStatus: IntellijGitActions['refreshStatus'] = async () => {
-    const repoId = state.activeRepoId
-    if (repoId === null) return
-    statusRequestSeq += 1
-    const token = statusRequestSeq
-    set({ statusLoading: true, statusError: null })
+  let activityGeneration = 0
+  /** The activity operation holding the owner (a read, or Clear's POST), or null. */
+  let owner: Promise<void> | null = null
+  /** True from Clear's entry until it settles: no trailing read starts meanwhile. */
+  let clearing = false
+  /** One trailing read, requested while another operation held the owner. */
+  let readPending: { full: boolean } | null = null
+  let clearInFlight: Promise<void> | null = null
+
+  /**
+   * Merge one read into the client list.
+   * @param full - whether a full snapshot was requested.
+   * @param generation - `activityGeneration` at the read's start.
+   */
+  const readActivity = async (full: boolean, generation: number): Promise<void> => {
+    const lastSeen = state.activityLastSeenId
+    const bootId = state.activityBootId
+    const cursor = full || bootId === null ? undefined : lastSeen
     try {
-      const status = await api.status(repoId)
-      if (token !== statusRequestSeq || state.activeRepoId !== repoId) return
-      const digestChanged = state.statusDigest !== status.statusDigest
-      const previous = state.selected
-      const listed = new Set<string>([
-        ...status.changes.map(entry => entry.path),
-        ...status.unversioned,
-      ])
-      const keep = previous !== null && previous.repoId === repoId && listed.has(previous.path) ? previous : null
-      set({
-        status,
-        statusDigest: status.statusDigest,
-        statusLoading: false,
-        statusError: null,
-        lastCheckedAt: Date.now(),
-        inclusions: { ...state.inclusions, [repoId]: seedInclusions(repoId, status) },
-        selected: keep,
-        ...(keep === null ? { diff: null, diffError: null } : {}),
-      })
-      // A kept selection whose content moved is re-read, and its hunk keys are
-      // pruned to what the fresh diff still has. An unchanged file costs nothing.
-      if (digestChanged && keep !== null) {
-        try {
-          const diff = await loadDiff(keep)
-          pruneHunksTo(repoId, keep.path, diff)
-        } catch {
-          // Surfaced through `diffError`.
+      let response = await api.activity(cursor)
+      if (generation !== activityGeneration) return
+      let replace = cursor === undefined
+      if (cursor !== undefined && (response.bootId !== bootId || (response.oldestId !== null && response.oldestId > lastSeen + 1))) {
+        // A new ring (host restart: ids restart at 1) or eviction past the cursor:
+        // the cursor slice would skip entries, so take a whole snapshot.
+        response = await api.activity(undefined)
+        if (generation !== activityGeneration) return
+        replace = true
+      }
+      let list: readonly ActivityEntry[]
+      let truncated = state.activityTruncated
+      if (replace) {
+        list = response.entries
+        truncated = response.oldestId === null ? response.latestId > 0 : response.oldestId > 1
+      } else {
+        list = [...state.activity, ...response.entries]
+        if (list.length > ACTIVITY_CAPACITY) {
+          list = list.slice(list.length - ACTIVITY_CAPACITY)
+          truncated = true
         }
       }
-    } catch (error) {
-      if (token !== statusRequestSeq || state.activeRepoId !== repoId) return
-      set({ statusLoading: false, statusError: error instanceof Error ? error.message : String(error) })
+      const grew = response.entries.length > 0
+      set({
+        activity: list,
+        activityBootId: response.bootId,
+        activityLastSeenId: response.latestId,
+        activityTruncated: truncated,
+        activityStale: false,
+        ...(grew && !state.activityOpen ? { activityUnread: true } : {}),
+      })
+    } catch {
+      if (generation === activityGeneration) set({ activityStale: true })
     }
   }
 
+  /** Start the trailing read when nothing holds the owner. */
+  const drain = (): void => {
+    if (readPending === null || owner !== null || clearing) return
+    const { full } = readPending
+    readPending = null
+    hold(readActivity(full, activityGeneration))
+  }
+
+  /**
+   * Hold the owner for one operation; release drains the trailing read.
+   * @param operation - the in-flight read or Clear POST.
+   */
+  const hold = (operation: Promise<void>): void => {
+    owner = operation.then(release, release)
+  }
+
+  const release = (): void => {
+    owner = null
+    drain()
+  }
+
+  /**
+   * Request an activity read. One serial owner means at most one `GET activity`
+   * or `POST activity/clear` is in flight; a request made meanwhile collapses
+   * into one trailing read, and a full request upgrades it to full.
+   * @param options - `full` asks for a whole snapshot.
+   * @returns resolves once no read is held or queued.
+   */
+  const scheduleActivityRefresh = async (options: { full?: boolean } = {}): Promise<void> => {
+    const full = options.full === true
+    if (owner !== null || clearing) readPending = { full: full || (readPending?.full ?? false) }
+    else hold(readActivity(full, activityGeneration))
+    while (owner !== null || readPending !== null || clearing) {
+      if (owner === null) await new Promise<void>(resolve => { setTimeout(resolve, 0) })
+      else await owner
+    }
+  }
+
+  // ------------------------------------------------------------ diff + status
+
   /**
    * Load one file's diff and reveal it.
+   *
+   * Every call takes a new `diffRequestSeq`; a response that is no longer the
+   * latest is `superseded` and published nowhere, so a slow response can neither
+   * reinstate a file the Human left nor drive a derived mutation.
    * @param file - the file to show.
-   * @returns the diff.
+   * @returns the tagged outcome.
    */
-  const loadDiff = async (file: SelectedFile): Promise<FileDiffResponse> => {
+  const loadDiff = async (file: SelectedFile): Promise<DiffOutcome> => {
+    diffRequestSeq += 1
+    const seq = diffRequestSeq
     set({ diffLoading: true, diffError: null })
     try {
       const diff = await api.diff({
@@ -459,46 +637,115 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
         ...(file.origPath === null ? {} : { origPath: file.origPath }),
         status: file.status,
       })
+      if (seq !== diffRequestSeq) return { kind: 'superseded' }
       set({ diff, diffLoading: false, selected: file })
-      return diff
+      return { kind: 'current', diff }
     } catch (error) {
+      if (seq !== diffRequestSeq) return { kind: 'superseded' }
       set({ diffLoading: false, diffError: error instanceof Error ? error.message : String(error) })
-      throw error
+      return { kind: 'failed' }
     }
   }
 
   /**
-   * Run one sync leg and turn its outcome into state.
+   * Load one repository's status.
+   *
+   * Sequenced: the token and the repository are captured before the call and
+   * re-checked after it, so a slow tick can neither overwrite a newer status nor
+   * paint one repository's list under another.
+   * @param repoIdArg - defaults to the active repository.
+   * @param origin - `auto` marks a watcher-driven call (no spinner, dimmed in the dock).
+   * @returns the applied status, or null when the call failed or was superseded.
+   */
+  const refreshStatus: IntellijGitActions['refreshStatus'] = async (repoIdArg, origin = 'user') => {
+    const repoId = repoIdArg ?? state.activeRepoId
+    if (repoId === null || repoId !== state.activeRepoId) return null
+    statusRequestSeq += 1
+    const token = statusRequestSeq
+    set(origin === 'auto' ? { statusError: null } : { statusLoading: true, statusError: null })
+    try {
+      const status = await api.status(repoId, origin === 'auto' ? { origin } : undefined)
+      if (token !== statusRequestSeq || state.activeRepoId !== repoId) return null
+      const digestChanged = state.statusDigest !== status.statusDigest
+      const previous = state.selected
+      const listed = new Set<string>([
+        ...status.changes.map(entry => entry.path),
+        ...status.unversioned,
+      ])
+      const keep = previous !== null && previous.repoId === repoId && listed.has(previous.path) ? previous : null
+      if (keep === null && previous !== null) diffRequestSeq += 1
+      set({
+        status,
+        statusDigest: status.statusDigest,
+        statusLoading: false,
+        statusError: null,
+        lastCheckedAt: Date.now(),
+        inclusions: { ...state.inclusions, [repoId]: seedInclusions(repoId, status) },
+        selected: keep,
+        ...(keep === null ? { diff: null, diffError: null, diffLoading: false } : {}),
+      })
+      // A kept selection whose content moved is re-read, and its hunk keys are
+      // pruned to what the fresh diff still has. The prune is a derived mutation,
+      // so it runs only when the outcome is current, this status is still the
+      // latest and the selection is still the same file.
+      if (digestChanged && keep !== null) {
+        const outcome = await loadDiff(keep)
+        const now = state.selected
+        if (
+          outcome.kind === 'current'
+          && token === statusRequestSeq
+          && now !== null
+          && now.repoId === repoId
+          && now.path === keep.path
+        ) {
+          pruneHunksTo(repoId, keep.path, outcome.diff)
+        }
+      }
+      return status
+    } catch (error) {
+      if (token !== statusRequestSeq || state.activeRepoId !== repoId) return null
+      set({ statusLoading: false, statusError: error instanceof Error ? error.message : String(error) })
+      return null
+    }
+  }
+
+  /**
+   * Run one sync leg and turn its outcome into a state patch.
    *
    * A refusal or a conflict keeps `syncOffer` so the Human can pick the other
    * order; only a success or an explicit dismiss clears it. The offer is the same
    * shape whether it came from a rejected commit-and-push or from the persistent
-   * `Push…` action, so an unpushed commit is never a dead end.
+   * `Push...` action, so an unpushed commit is never a dead end. The caller owns
+   * the `busy` descriptor and releases it with the returned patch.
    * @param repoId - the repository to integrate.
    * @param mode - the leg to run.
+   * @param status - the status the write captured.
+   * @returns the outcome patch.
    */
-  const runSync = async (repoId: string, mode: SyncMode): Promise<void> => {
-    const status = state.status
-    if (status === null) return
-    set({ busy: 'sync', banner: null })
+  const syncLeg = async (repoId: string, mode: SyncMode, status: RepoStatusResponse): Promise<Partial<IntellijGitState>> => {
     try {
       const response: SyncResponse = await api.sync({ repoId, expectedHeadOid: status.headOid, mode })
       await refreshStatus()
       const branch = state.status?.branch ?? status.branch
       if (response.pushErrorCode === 'PUSH_REJECTED') {
-        set({ busy: null, syncOffer: { target: response.pushTarget ?? status.pushTarget ?? '', branch } })
-        return
+        return { syncOffer: { target: response.pushTarget ?? status.pushTarget ?? '', branch } }
       }
       if (!response.pushed) {
         const key: DshIntellijGitKey = response.pushErrorCode === 'NO_PUSH_TARGET' ? 'commit.pushNoTarget' : 'commit.pushFailed'
-        set({
-          busy: null,
+        return {
           ...(response.pushErrorCode === 'NO_PUSH_TARGET' ? { syncOffer: null } : {}),
           banner: { kind: 'error', key, params: { sha: response.headShortSha, hint: response.pushError ?? '', reason: response.pushError ?? '' } },
-        })
-        return
+        }
       }
-      set({ busy: null, syncOffer: null, banner: { kind: 'notice', key: 'sync.done', params: { mode, sha: response.headShortSha } } })
+      return {
+        syncOffer: null,
+        toast: {
+          key: mode === 'push' ? 'push.done' : 'sync.done',
+          params: { mode, sha: response.headShortSha },
+          at: Date.now(),
+          sha: response.headShortSha,
+        },
+      }
     } catch (error) {
       const code = error instanceof ApiError ? error.code : ''
       const rawPaths = error instanceof ApiError ? error.details?.['paths'] : undefined
@@ -513,20 +760,80 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
             : code === 'INTEGRATION_IN_PROGRESS'
               ? 'sync.inProgress'
               : 'sync.failed'
-      set({ busy: null, banner: { kind: 'error', key, params: { paths: paths.join(', '), reason } } })
-    } finally {
-      void actions.refreshActivity()
+      return { banner: { kind: 'error', key, params: { paths: paths.join(', '), reason, mode } } }
     }
   }
+
+  /**
+   * Run one push/rebase/merge leg under the write lock.
+   * @param repoId - the repository to integrate.
+   * @param mode - the leg to run.
+   * @param status - the status the write captured.
+   */
+  const runSync = async (repoId: string, mode: SyncMode, status: RepoStatusResponse): Promise<void> => {
+    const opId = beginOp(mode, repoId, { target: status.pushTarget ?? '', count: status.ahead })
+    let patch: Partial<IntellijGitState> = {}
+    try {
+      patch = await syncLeg(repoId, mode, status)
+    } finally {
+      finishOp(opId, patch)
+    }
+  }
+
+  // ----------------------------------------------------------------- watcher
+
+  /**
+   * Start the 5 s digest poll plus the visibility/focus refresh.
+   * @returns the stop function.
+   */
+  const startWatcher = (): (() => void) => {
+    let inFlight = false
+    let disposed = false
+    /**
+     * One tick: probe the digest and refresh only when it moved.
+     *
+     * Skipped while a write is in flight, while a confirmation is open and while
+     * a status load is running, so a background refresh never interleaves with
+     * something the Human is doing.
+     */
+    const tick = async (): Promise<void> => {
+      if (disposed || inFlight) return
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      const repoId = state.activeRepoId
+      if (repoId === null || state.busy !== null || state.pending !== null || state.statusLoading) return
+      inFlight = true
+      try {
+        const watch = await api.watch({ repoId })
+        if (disposed || state.activeRepoId !== repoId) return
+        if (state.watchFailing) set({ watchFailing: false })
+        if (watch.digest !== state.statusDigest) await refreshStatus(repoId, 'auto')
+      } catch {
+        // A failing probe is reported in the toolbar, never as a banner.
+        if (!disposed) set({ watchFailing: true })
+      } finally {
+        inFlight = false
+      }
+    }
+    const timer = setInterval(() => { void tick() }, WATCH_INTERVAL_MS)
+    const onWake = (): void => { void tick() }
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onWake)
+    if (typeof window !== 'undefined') window.addEventListener('focus', onWake)
+    return () => {
+      disposed = true
+      clearInterval(timer)
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onWake)
+      if (typeof window !== 'undefined') window.removeEventListener('focus', onWake)
+    }
+  }
+  let stopWatcher: (() => void) | null = null
 
   const actions: IntellijGitActions = {
     async bootstrap() {
       await actions.refreshTree()
       // `refreshTree` already loads the status when it selects the root; this
-      // covers the case where a repository was open before the first load, and
-      // gives the watcher an active repository either way.
+      // covers the case where a repository was open before the first load.
       if (state.activeRepoId !== null && state.status === null) await refreshStatus()
-      await actions.refreshActivity()
+      await scheduleActivityRefresh({ full: true })
     },
 
     async refreshTree() {
@@ -544,29 +851,29 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     },
 
     async refreshAll() {
-      // What the tooltip has always promised: the repository list, the change
-      // list of the open repository, and the diff currently on screen.
+      // The repository list, the change list of the open repository, and the
+      // diff currently on screen.
       await actions.refreshTree()
       await refreshStatus()
-      if (state.selected !== null) {
-        try {
-          await loadDiff(state.selected)
-        } catch {
-          // Surfaced through `diffError`.
-        }
-      }
-      await actions.refreshActivity()
+      if (state.selected !== null) await loadDiff(state.selected)
+      await scheduleActivityRefresh({ full: true })
     },
 
     async toggleRepo(repoId) {
+      // The repository is locked while a write runs: switching would drop the
+      // status the write captured and its completion would repaint the wrong list.
+      if (state.busy !== null) return
       // Collapse keys are reset on both branches: the requirement is "always
       // expanded when that repository is selected", so a collapse the Human made
       // in an earlier visit must not survive into the next one.
       if (state.activeRepoId === repoId && state.reposExpanded.includes(repoId)) {
-        set({ reposExpanded: [], status: null, statusDigest: null, selected: null, diff: null, collapsedNodes: [] })
+        diffRequestSeq += 1
+        set({ reposExpanded: [], status: null, statusDigest: null, selected: null, diff: null, diffLoading: false, collapsedNodes: [] })
         return
       }
       // Single-Active-Repo Accordion: the previous repository collapses with its status.
+      diffRequestSeq += 1
+      draftGeneration += 1
       set({
         activeRepoId: repoId,
         reposExpanded: [repoId],
@@ -576,6 +883,7 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
         selected: null,
         diff: null,
         diffError: null,
+        diffLoading: false,
         amend: false,
         message: '',
         collapsedNodes: [],
@@ -619,73 +927,42 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
 
     refreshStatus,
 
-    startWatch() {
-      let inFlight = false
-      let disposed = false
-      /**
-       * One tick: probe the digest and refresh only when it moved.
-       *
-       * The tick is skipped while a write is in flight, while a confirmation is
-       * open, and while a status load is running, so a background refresh can
-       * never interleave with something the Human is doing.
-       */
-      const tick = async (): Promise<void> => {
-        if (disposed || inFlight) return
-        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-        const repoId = state.activeRepoId
-        if (repoId === null || state.busy !== null || state.pending !== null || state.statusLoading) return
-        inFlight = true
-        try {
-          const watch = await api.watch({ repoId })
-          if (disposed || state.activeRepoId !== repoId) return
-          if (state.watchFailing) set({ watchFailing: false })
-          if (watch.digest !== state.statusDigest) await refreshStatus()
-        } catch {
-          // A failing probe is reported in the toolbar, never as a banner: the
-          // Human's own actions still work.
-          if (!disposed) set({ watchFailing: true })
-        } finally {
-          inFlight = false
-        }
-      }
-      const timer = setInterval(() => { void tick() }, WATCH_INTERVAL_MS)
-      const onWake = (): void => { void tick() }
-      if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onWake)
-      if (typeof window !== 'undefined') window.addEventListener('focus', onWake)
-      return () => {
-        disposed = true
-        clearInterval(timer)
-        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onWake)
-        if (typeof window !== 'undefined') window.removeEventListener('focus', onWake)
+    setPageActive(active) {
+      if (state.pageActive === active) return
+      set({ pageActive: active })
+      if (active) {
+        if (state.activeRepoId !== null && state.busy === null) void refreshStatus()
+        stopWatcher = startWatcher()
+      } else {
+        stopWatcher?.()
+        stopWatcher = null
       }
     },
 
-    async openFile(sessionId, file) {
-      set({ selected: file })
-      options.openDiffTab(sessionId)
-      try {
-        await loadDiff(file)
-      } catch {
-        // Surfaced through `diffError`.
-      }
+    async openFile(file) {
+      set({ selected: file, diff: null })
+      await loadDiff(file)
     },
 
     async refreshDiff() {
       const selected = state.selected
       if (selected === null) return
-      try {
-        await loadDiff(selected)
-      } catch {
-        // Surfaced through `diffError`.
-      }
+      await loadDiff(selected)
     },
 
     setViewMode(mode) {
+      writePref('viewMode', mode)
       set({ viewMode: mode })
     },
 
     toggleCollapse() {
+      writePref('collapseUnchanged', !state.collapseUnchanged)
       set({ collapseUnchanged: !state.collapseUnchanged })
+    },
+
+    toggleWrap() {
+      writePref('wrap', !state.wrapLines)
+      set({ wrapLines: !state.wrapLines })
     },
 
     toggleCompact() {
@@ -693,19 +970,23 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     },
 
     toggleGroup(group) {
+      if (state.busy !== null) return
       applyToFiles(filesOf(group), group.check !== 'checked')
     },
 
     toggleNode(node) {
+      if (state.busy !== null) return
       const files = filesOf(node as GroupNode)
       applyToFiles(files, !files.every(file => file.check === 'checked'))
     },
 
     toggleFile(file) {
+      if (state.busy !== null) return
       applyToFiles([file], file.check !== 'checked')
     },
 
     toggleCurrentVersion() {
+      if (state.busy !== null) return
       const selected = state.selected
       const diff = state.diff
       if (selected === null || diff === null) return
@@ -719,6 +1000,7 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     },
 
     toggleHunk(contentKey) {
+      if (state.busy !== null) return
       const selected = state.selected
       const diff = state.diff
       if (selected === null || diff === null) return
@@ -741,35 +1023,47 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     },
 
     setAmend(value) {
+      if (state.busy !== null) return
       // IntelliJ prefills the amended commit's own message; without this the host
       // would commit the literal 'amend' when the box is empty.
       const prefill = value && state.message.trim() === '' ? (state.status?.lastCommitMessage ?? '') : state.message
+      draftGeneration += 1
       set({ amend: value, message: prefill })
     },
 
     setMessage(value) {
+      if (state.busy !== null) return
+      draftGeneration += 1
       set({ message: value })
     },
 
     async generateMessage(sessionId) {
       const repoId = state.activeRepoId
-      if (repoId === null) return
-      set({ aiBusy: true, banner: null })
+      if (repoId === null || state.busy !== null || state.aiBusy) return
+      const generation = draftGeneration
+      set({ aiBusy: true, aiError: null })
       try {
         const response: GenerateMessageResponse = await api.generateMessage({
           repoId,
           files: selectedInclusions(state, repoId),
           ...(sessionId === undefined ? {} : { sessionId }),
         })
+        // A message typed, a repository switch or a commit since the request
+        // started makes this answer stale: drop it rather than overwrite the draft.
+        if (generation !== draftGeneration || state.busy !== null || state.activeRepoId !== repoId) {
+          set({ aiBusy: false })
+          return
+        }
+        draftGeneration += 1
         set({ message: response.message, aiRoute: `${response.route.provider}/${response.route.model}`, aiBusy: false })
       } catch (error) {
-        failBanner(error, 'commit.generate')
+        set({ aiBusy: false, aiError: error instanceof Error ? error.message : String(error) })
       }
     },
 
     requestCommit(push) {
       if (state.busy !== null || state.pending !== null) return
-      set({ pending: { kind: 'commit', origin: 'commit', push }, banner: null })
+      set({ pending: { kind: 'commit', origin: 'commit', push }, banner: null, toast: null })
     },
 
     requestPush() {
@@ -779,38 +1073,74 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
       const status = state.status
       if (status === null || status.ahead <= 0) return
       if (state.busy !== null || state.pending !== null) return
-      set({ pending: { kind: 'push', origin: 'commit' }, banner: null })
+      set({ pending: { kind: 'push', origin: 'commit' }, banner: null, toast: null })
     },
 
     async sync(mode) {
-      if (state.busy !== null || state.activeRepoId === null) return
-      await runSync(state.activeRepoId, mode)
+      const repoId = state.activeRepoId
+      const status = state.status
+      if (state.busy !== null || repoId === null || status === null) return
+      await runSync(repoId, mode, status)
     },
 
     dismissSyncOffer() {
+      if (state.busy !== null) return
       set({ syncOffer: null })
     },
 
     async refreshActivity() {
-      try {
-        const response = await api.activity()
-        set({ activity: response.entries })
-      } catch {
-        // The dock stays on its last snapshot; a probe failure never raises a banner.
-      }
+      await scheduleActivityRefresh({ full: true })
     },
 
     async clearActivity() {
-      try {
-        await api.clearActivity()
-        set({ activity: [], activityDetail: [] })
-      } catch (error) {
-        failBanner(error, 'activity.clear')
-      }
+      if (clearInFlight !== null) return clearInFlight
+      clearing = true
+      activityGeneration += 1
+      set({ activityClearing: true, activityError: null })
+      clearInFlight = (async () => {
+        let cleared = false
+        try {
+          // The held read (if any) was started in the old generation and drops its
+          // own publish; waiting for it keeps one request in flight at a time.
+          if (owner !== null) await owner
+          const post = api.clearActivity()
+          hold(post.then(() => undefined, () => undefined))
+          try {
+            const response = await post
+            set({
+              activity: [],
+              activityDetail: [],
+              activityGroupsOpen: [],
+              activityBootId: response.bootId,
+              activityLastSeenId: response.latestId,
+              activityTruncated: true,
+              activityUnread: false,
+              activityStale: false,
+            })
+            cleared = true
+          } catch (error) {
+            set({ activityError: error instanceof Error ? error.message : String(error) })
+          }
+        } finally {
+          clearing = false
+          clearInFlight = null
+          set({ activityClearing: false })
+          // Always one trailing read. After a successful Clear it is a cursor read
+          // (Clear takes precedence over a queued full upgrade: the list is empty and
+          // the cursor is the clear response's latestId); after a failed Clear it
+          // stays full only if a full read was queued meanwhile.
+          const full = cleared ? false : (readPending?.full ?? false)
+          if (cleared) readPending = null
+          void scheduleActivityRefresh({ full })
+        }
+      })()
+      return clearInFlight
     },
 
     toggleActivity() {
-      set({ activityOpen: !state.activityOpen })
+      const open = !state.activityOpen
+      writePref('dockOpen', open)
+      set({ activityOpen: open, ...(open ? { activityUnread: false } : {}) })
     },
 
     toggleActivityDetail(id) {
@@ -821,20 +1151,34 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
       })
     },
 
+    toggleActivityGroup(key) {
+      set({
+        activityGroupsOpen: state.activityGroupsOpen.includes(key)
+          ? state.activityGroupsOpen.filter(item => item !== key)
+          : [...state.activityGroupsOpen, key],
+      })
+    },
+
+    toggleShowBackground() {
+      writePref('showBackground', !state.showBackground)
+      set({ showBackground: !state.showBackground })
+    },
+
     requestRollback() {
       if (state.busy !== null || state.pending !== null) return
-      set({ pending: { kind: 'rollback', origin: 'commit' }, banner: null })
+      set({ pending: { kind: 'rollback', origin: 'commit' }, banner: null, toast: null })
     },
 
     requestRevertHunk(contentKey, path) {
       if (state.busy !== null || state.pending !== null) return
-      set({ pending: { kind: 'revertHunk', origin: 'diff', contentKey, path }, banner: null })
+      set({ pending: { kind: 'revertHunk', origin: 'diff', contentKey, path }, banner: null, toast: null })
     },
 
     async confirmPending() {
       const pending = state.pending
       const repoId = state.activeRepoId
       const status = state.status
+      if (state.busy !== null) return
       if (pending === null || repoId === null || status === null) {
         set({ pending: null })
         return
@@ -842,11 +1186,14 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
       const files = selectedInclusions(state, repoId)
       set({ pending: null })
       if (pending.kind === 'push') {
-        await runSync(repoId, 'push')
+        await runSync(repoId, 'push', status)
         return
       }
       if (pending.kind === 'commit') {
-        set({ busy: 'commit', banner: null })
+        const opId = beginOp(pending.push ? 'commitPush' : 'commit', repoId, { count: files.length, target: status.pushTarget ?? '' })
+        // A generation answer that lands after the commit must not refill the box.
+        draftGeneration += 1
+        let patch: Partial<IntellijGitState> = {}
         try {
           const response: CommitResponse = await api.commit({
             repoId,
@@ -868,70 +1215,76 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
           }
           setInclusions(repoId, after)
           await refreshStatus()
-          void actions.refreshActivity()
-          if (response.headMovedDuringCommit) {
-            set({ busy: null, banner: { kind: 'error', key: 'commit.headMoved' } })
-            return
-          }
           const sha = (response.commitSha ?? '').slice(0, 7)
-          if (!response.indexSynced) {
-            set({ busy: null, banner: { kind: 'error', key: 'commit.indexWarning', params: { reason: response.indexSyncError ?? '' } } })
-            return
-          }
-          const leftBehind = files.filter(file => !file.partial).map(file => file.path).filter(path => stillListed(state, path))
-          if (leftBehind.length > 0) {
-            set({ busy: null, banner: { kind: 'error', key: 'commit.notApplied', params: { paths: leftBehind.join(', ') } } })
-            return
-          }
-          if (pending.push && !response.pushed) {
-            if (response.pushErrorCode === 'PUSH_REJECTED') {
-              // The commit is kept; the offer is what turns the rejection into a choice.
-              set({ busy: null, syncOffer: { target: response.pushTarget ?? status.pushTarget ?? '', branch: state.status?.branch ?? status.branch } })
-              return
+          if (response.headMovedDuringCommit) {
+            patch = { banner: { kind: 'error', key: 'commit.headMoved' } }
+          } else if (!response.indexSynced) {
+            patch = { banner: { kind: 'error', key: 'commit.indexWarning', params: { reason: response.indexSyncError ?? '' } } }
+          } else {
+            const leftBehind = files.filter(file => !file.partial).map(file => file.path).filter(path => stillListed(state, path))
+            if (leftBehind.length > 0) {
+              patch = { banner: { kind: 'error', key: 'commit.notApplied', params: { paths: leftBehind.join(', ') } } }
+            } else if (pending.push && !response.pushed) {
+              if (response.pushErrorCode === 'PUSH_REJECTED') {
+                // The commit is kept; the offer is what turns the rejection into a choice.
+                patch = { syncOffer: { target: response.pushTarget ?? status.pushTarget ?? '', branch: state.status?.branch ?? status.branch } }
+              } else {
+                const key: DshIntellijGitKey = response.pushErrorCode === 'NO_PUSH_TARGET' ? 'commit.pushNoTarget' : 'commit.pushFailed'
+                patch = { banner: { kind: 'error', key, params: { sha, hint: response.pushError ?? '', reason: response.pushError ?? '' } } }
+              }
+            } else {
+              patch = {
+                message: '',
+                amend: false,
+                toast: { key: response.pushed ? 'commit.pushed' : 'commit.done', params: { sha }, at: Date.now(), ...(sha === '' ? {} : { sha }) },
+              }
             }
-            const key: DshIntellijGitKey = response.pushErrorCode === 'NO_PUSH_TARGET' ? 'commit.pushNoTarget' : 'commit.pushFailed'
-            set({ busy: null, banner: { kind: 'error', key, params: { sha, hint: response.pushError ?? '', reason: response.pushError ?? '' } } })
-            return
           }
-          set({ busy: null, message: '', amend: false, banner: { kind: 'notice', key: response.pushed ? 'commit.pushed' : 'commit.done', params: { sha } } })
         } catch (error) {
-          if (handleStaleHunks(error, repoId, 'commit.button')) return
-          failBanner(error, 'commit.button')
+          patch = staleHunksPatch(error, repoId) ?? errorBanner(error, 'commit.button')
+        } finally {
+          finishOp(opId, patch)
         }
         return
       }
 
-      set({ busy: pending.kind === 'rollback' ? 'rollback' : 'revertHunk', banner: null })
+      const isRollback = pending.kind === 'rollback'
+      const opId = beginOp(isRollback ? 'rollback' : 'revertHunk', repoId, { count: files.length })
+      let patch: Partial<IntellijGitState> = {}
       try {
-        if (pending.kind === 'rollback') {
+        if (isRollback) {
           const response = await api.rollback({ repoId, expectedHeadOid: status.headOid, files, confirmDeletePaths: true })
+          diffRequestSeq += 1
           await refreshStatus()
-          void actions.refreshActivity()
-          set({ busy: null, diff: null, selected: null, banner: { kind: 'notice', key: 'rollback.done', params: { count: response.rolledBack.length } } })
-          return
+          patch = {
+            diff: null,
+            selected: null,
+            diffLoading: false,
+            toast: { key: 'rollback.done', params: { count: response.rolledBack.length }, at: Date.now() },
+          }
+        } else {
+          const selected = state.selected
+          if (selected !== null) {
+            await api.rollback({
+              repoId,
+              expectedHeadOid: status.headOid,
+              confirmDeletePaths: true,
+              files: [{
+                path: selected.path,
+                ...(selected.origPath === null ? {} : { origPath: selected.origPath }),
+                status: selected.status,
+                partial: true,
+                hunkKeys: [pending.contentKey],
+              }],
+            })
+            await refreshStatus()
+            if (state.selected !== null) await loadDiff(state.selected)
+          }
         }
-        const selected = state.selected
-        if (selected !== null) {
-          await api.rollback({
-            repoId,
-            expectedHeadOid: status.headOid,
-            confirmDeletePaths: true,
-            files: [{
-              path: selected.path,
-              ...(selected.origPath === null ? {} : { origPath: selected.origPath }),
-              status: selected.status,
-              partial: true,
-              hunkKeys: [pending.contentKey],
-            }],
-          })
-          await refreshStatus()
-          void actions.refreshActivity()
-          await loadDiff(selected)
-        }
-        set({ busy: null })
       } catch (error) {
-        if (handleStaleHunks(error, repoId, pending.kind === 'rollback' ? 'toolbar.rollback' : 'diff.deleteHunk')) return
-        failBanner(error, pending.kind === 'rollback' ? 'toolbar.rollback' : 'diff.deleteHunk')
+        patch = staleHunksPatch(error, repoId) ?? errorBanner(error, isRollback ? 'toolbar.rollback' : 'diff.deleteHunk')
+      } finally {
+        finishOp(opId, patch)
       }
     },
 
@@ -942,7 +1295,13 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     dismissBanner() {
       set({ banner: null })
     },
+
+    dismissToast() {
+      set({ toast: null })
+    },
   }
+
+  // The apply-level teardown stops the watcher through this when the page is gone.
 
   return {
     getSnapshot: () => state,
@@ -953,6 +1312,7 @@ export function createIntellijGitStore(options: StoreOptions): IntellijGitStore 
     actions,
   }
 }
+
 
 /** One inclusion as the wire expects it. */
 export interface WireInclusion {

@@ -20,9 +20,10 @@
  * Human asked for, and a restart is allowed to forget it.
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import { isAbsolute, relative } from 'node:path'
 
-import { ACTIVITY_CAPACITY, ACTIVITY_OUTPUT_LIMIT, type ActivityEntry } from '../config.ts'
+import { ACTIVITY_CAPACITY, ACTIVITY_OUTPUT_LIMIT, type ActivityEntry, type ActivityMeta } from '../config.ts'
 import type { GitRunEvent } from './git-runner.ts'
 
 /** Marker appended to output that was cut to fit the buffer. */
@@ -48,10 +49,23 @@ export interface ActivityLog {
   recordApi(input: ApiActivityInput): void
   /** Record one `git` invocation, unless the current async scope is silenced. */
   recordGit(event: GitRunEvent): void
-  /** The recorded entries, oldest first. */
-  list(): readonly ActivityEntry[]
-  /** Drop every entry and report how many were dropped. */
+  /**
+   * The recorded entries, oldest first.
+   * @param after - when given, only entries with `id > after`.
+   */
+  list(after?: number): readonly ActivityEntry[]
+  /** Whole-ring facts, independent of any cursor. */
+  meta(): ActivityMeta
+  /** Drop every entry and report how many were dropped; ids are never reset. */
   clear(): number
+  /**
+   * Run `fn` inside a request scope: allocate one request id and stamp it, with
+   * the origin, on every entry recorded inside `fn`'s async context.
+   * @param origin - who caused the request.
+   * @param fn - the handler plus its own recording.
+   * @returns whatever `fn` resolves to.
+   */
+  withRequest<T>(origin: 'user' | 'auto', fn: () => Promise<T>): Promise<T>
   /**
    * Run `fn` with recording suppressed for its whole async context.
    * @param fn - the work whose requests and commands stay out of the buffer.
@@ -122,7 +136,10 @@ function gitOutput(event: GitRunEvent): string {
 export function createActivityLog(capacity: number = ACTIVITY_CAPACITY): ActivityLog {
   const entries: ActivityEntry[] = []
   const silence = new AsyncLocalStorage<true>()
+  const requests = new AsyncLocalStorage<{ readonly requestId: number, readonly origin: 'user' | 'auto' }>()
+  const bootId = randomUUID()
   let nextId = 1
+  let nextRequestId = 1
   let root: string | null = null
 
   /**
@@ -130,7 +147,13 @@ export function createActivityLog(capacity: number = ACTIVITY_CAPACITY): Activit
    * @param entry - the entry without its id and timestamp.
    */
   const push = (entry: Omit<ActivityEntry, 'id' | 'at'>): void => {
-    entries.push({ ...entry, id: nextId, at: Date.now() })
+    const scope = requests.getStore()
+    entries.push({
+      ...entry,
+      id: nextId,
+      at: Date.now(),
+      ...(scope === undefined ? {} : { requestId: scope.requestId, origin: scope.origin }),
+    })
     nextId += 1
     while (entries.length > capacity) entries.shift()
   }
@@ -164,8 +187,18 @@ export function createActivityLog(capacity: number = ACTIVITY_CAPACITY): Activit
       })
     },
 
-    list() {
-      return [...entries]
+    list(after) {
+      return after === undefined ? [...entries] : entries.filter(entry => entry.id > after)
+    },
+
+    meta() {
+      return { bootId, oldestId: entries[0]?.id ?? null, latestId: nextId - 1 }
+    },
+
+    withRequest(origin, fn) {
+      const requestId = nextRequestId
+      nextRequestId += 1
+      return requests.run({ requestId, origin }, fn)
     },
 
     clear() {

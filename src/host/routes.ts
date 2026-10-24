@@ -19,6 +19,7 @@ import type { ConnectionFetchRoute } from '@deepseek-ai/dsh-client-connection'
 import {
   CHANNEL_METHODS,
   INTEGRATE_TIMEOUT_MS,
+  ORIGIN_HEADER,
   ROUTES,
   type ActivityClearResponse,
   type ActivityListResponse,
@@ -259,13 +260,25 @@ export function createHandlers(ctx: Context, options: RouteOptions): Record<Rout
     return ok(await integrateRepo({ repoRoot, request: payload, timeoutMs: INTEGRATE_TIMEOUT_MS }))
   }
 
-  const activity = async (): Promise<Response> => {
-    const response: ActivityListResponse = { entries: options.activity.list() }
+  const activity = async (request: Request): Promise<Response> => {
+    const raw = new URL(request.url).searchParams.get('after')
+    let after: number | undefined
+    if (raw !== null) {
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+        return fail(400, { code: 'INVALID_REQUEST', message: 'after must be a non-negative integer' })
+      }
+      after = Number(raw)
+    }
+    // Entries first, metadata second, with no await between: both describe the same instant.
+    const entries = options.activity.list(after)
+    const response: ActivityListResponse = { entries, ...options.activity.meta() }
     return ok(response)
   }
 
   const activityClear = async (): Promise<Response> => {
-    const response: ActivityClearResponse = { cleared: options.activity.clear() }
+    const cleared = options.activity.clear()
+    const { bootId, latestId } = options.activity.meta()
+    const response: ActivityClearResponse = { cleared, bootId, latestId }
     return ok(response)
   }
 
@@ -305,29 +318,34 @@ export function registerRoutes(ctx: Context, options: RouteOptions): void {
         if (request.method !== spec.method) {
           return fail(405, { code: 'METHOD_NOT_ALLOWED', message: `use ${spec.method}` }, { allow: spec.method })
         }
-        const startedAt = Date.now()
-        let response: Response
-        try {
-          response = await handler(request)
-        } catch (error) {
-          response = error instanceof ApiHttpError
-            ? fail(error.status, error.body)
-            : fail(500, { code: 'INTERNAL', message: error instanceof Error ? error.message : String(error) })
+        // A silent route opens no request scope: it records nothing, and its id would only be noise.
+        const origin = request.headers.get(ORIGIN_HEADER) === 'auto' ? 'auto' : 'user'
+        const run = async (): Promise<Response> => {
+          const startedAt = Date.now()
+          let response: Response
+          try {
+            response = await handler(request)
+          } catch (error) {
+            response = error instanceof ApiHttpError
+              ? fail(error.status, error.body)
+              : fail(500, { code: 'INTERNAL', message: error instanceof Error ? error.message : String(error) })
+          }
+          if (spec.silent !== true) {
+            // Cloning before reading keeps the caller's body intact: consuming the
+            // original would hand the browser an empty response.
+            const body = await response.clone().text().catch(() => '')
+            options.activity.recordApi({
+              key: spec.key,
+              method: request.method,
+              path: new URL(request.url).pathname,
+              status: response.status,
+              durationMs: Date.now() - startedAt,
+              output: body,
+            })
+          }
+          return response
         }
-        if (spec.silent !== true) {
-          // Cloning before reading keeps the caller's body intact: consuming the
-          // original would hand the browser an empty response.
-          const body = await response.clone().text().catch(() => '')
-          options.activity.recordApi({
-            key: spec.key,
-            method: request.method,
-            path: new URL(request.url).pathname,
-            status: response.status,
-            durationMs: Date.now() - startedAt,
-            output: body,
-          })
-        }
-        return response
+        return spec.silent === true ? run() : options.activity.withRequest(origin, run)
       },
     }
     ctx.effect(() => {

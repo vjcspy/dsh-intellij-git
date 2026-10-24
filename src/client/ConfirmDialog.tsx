@@ -115,6 +115,7 @@ export function ConfirmDialog(props: ConfirmDialogProps): ReactNode {
   return (
     <Modal
       open
+      className="dsh-git-dialog"
       onClose={() => { store.actions.cancelPending() }}
       title={title}
       closeLabel={t('confirm.close')}

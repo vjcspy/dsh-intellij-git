@@ -1,7 +1,7 @@
 {
   "name": "dsh-intellij-git",
-  "version": "0.1.0",
-  "description": "DSH Web plugin: an IntelliJ IDEA style Non-Modal Commit tool window and interactive diff viewer for the right sidebar, spanning Aweave's root repo and every workspace repository.",
+  "version": "0.2.0",
+  "description": "DSH Web plugin: an IntelliJ IDEA style Git page (commit tree, interactive diff viewer and live grouped activity log) in the main area, opened from the left sidebar, spanning Aweave's root repo and every workspace repository.",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -47,7 +47,6 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-sidebar-right",
         "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-locale"
       ]
@@ -64,9 +63,10 @@
     "@deepseek-ai/dsh-client-locale": "link:../deepseek-harness/packages/client/locale",
     "@deepseek-ai/dsh-client-store": "link:../deepseek-harness/packages/client/store",
     "@deepseek-ai/dsh-client-ui-primitives": "link:../deepseek-harness/packages/client/ui-primitives",
+    "@deepseek-ai/dsh-client-ui-layout": "link:../deepseek-harness/packages/client/ui-layout",
     "@deepseek-ai/dsh-client-ui-renderer": "link:../deepseek-harness/packages/client/ui-renderer",
     "@deepseek-ai/dsh-client-ui-session": "link:../deepseek-harness/packages/client/ui-session",
-    "@deepseek-ai/dsh-client-ui-sidebar-right": "link:../deepseek-harness/packages/client/ui-sidebar-right",
+    "@deepseek-ai/dsh-client-ui-sidebar": "link:../deepseek-harness/packages/client/ui-sidebar",
     "@deepseek-ai/dsh-client-ui-slots": "link:../deepseek-harness/packages/client/ui-slots",
     "@deepseek-ai/schemastery": "link:../deepseek-harness/vendor/schemastery",
     "@types/node": "^22.20.0",

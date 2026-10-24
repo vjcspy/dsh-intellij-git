@@ -12,19 +12,14 @@
 /** Package id: the loader registration id, the Commit tab implementation id, and the tab body slot key. */
 export const PLUGIN_ID = 'dsh-intellij-git'
 
-/** Commit tool window: tab implementation id and kind. */
-export const COMMIT_TAB_ID = 'dsh-intellij-git'
-export const COMMIT_TAB_KIND = 'dsh-intellij-git'
+/** Main-area page key and left-sidebar row id. */
+export const PAGE_ID = 'dsh-intellij-git'
 
-/** Diff viewer: tab implementation id and kind. */
-export const DIFF_TAB_ID = 'dsh-intellij-git-diff'
-export const DIFF_TAB_KIND = 'dsh-intellij-git-diff'
-
-/** Guide-page entry identity contributed by the Commit tab kind. */
-export const GUIDE_ENTRY_ID = 'dsh-intellij-git'
-
-/** Ascending position of the guide entry among every registered type's entries. */
-export const GUIDE_ENTRY_ORDER = 46
+/**
+ * Ascending position of the left-sidebar row. `Plugins` is 0 and the optional
+ * `dshmarket` row is 1, so only 0.5 sits directly under `Plugins` in both states.
+ */
+export const PAGE_ROW_ORDER = 0.5
 
 /** Locale namespace owning every product-visible string this plugin renders. */
 export const LOCALE_NAMESPACE = 'dshIntellijGit'
@@ -51,7 +46,10 @@ export const MAX_AI_DIFF_BYTES = 16_000
 export const MAX_DIFF_FILE_BYTES = 4 * 1024 * 1024
 
 /** Entries the host-side activity ring buffer keeps. */
-export const ACTIVITY_CAPACITY = 150
+export const ACTIVITY_CAPACITY = 500
+
+/** Request header the browser sets to `auto` on watcher-driven calls; anything else reads as `user`. */
+export const ORIGIN_HEADER = 'x-dsh-git-origin'
 
 /** Characters of one entry's captured output that survive into the buffer. */
 export const ACTIVITY_OUTPUT_LIMIT = 1024
@@ -316,16 +314,33 @@ export interface ActivityEntry {
   readonly output?: string
   /** True when `output` was cut. */
   readonly truncated?: boolean
+  /** Id of the request that caused this entry; absent for entries recorded outside a request scope. */
+  readonly requestId?: number
+  /** `auto` for watcher-driven requests, `user` otherwise; absent outside a request scope. */
+  readonly origin?: 'user' | 'auto'
+}
+
+/** Whole-ring facts every activity answer carries, independent of the `after` cursor. */
+export interface ActivityMeta {
+  /** Random per ring (one per host process and plugin instance); a change means ids restarted. */
+  readonly bootId: string
+  /** Oldest retained entry id, or null when the ring is empty. */
+  readonly oldestId: number | null
+  /** Last allocated entry id, 0 before the first entry. */
+  readonly latestId: number
 }
 
 /** Answer of `activity`. */
-export interface ActivityListResponse {
+export interface ActivityListResponse extends ActivityMeta {
+  /** Entries with `id > after` (all entries without a cursor), oldest first. */
   readonly entries: readonly ActivityEntry[]
 }
 
 /** Answer of `activity/clear`. */
 export interface ActivityClearResponse {
   readonly cleared: number
+  readonly bootId: string
+  readonly latestId: number
 }
 
 /** Body of `repo/rollback`. */
