@@ -27,6 +27,7 @@ import {
 import { ROOT_REPO_ID, type FileChangeEntry } from '../config.ts'
 import { ActionButton } from './ActionButton.tsx'
 import { branchLabelOf } from './branch-label.ts'
+import { useCommitStamp } from './commit-stamp.ts'
 import type { DshIntellijGitKey, Translate } from './locale.ts'
 import { usePhase } from './phase.ts'
 import { groupsOf, selectedInclusions, type IntellijGitStore } from './store.ts'
@@ -41,6 +42,20 @@ export interface CommitPanelProps {
 
 /** Number of skeleton rows shown while a repository's first status loads. */
 const SKELETON_ROWS = 6
+/** Left padding of a depth-0 row, in px. */
+const ROW_INDENT_BASE = 6
+/** Extra left padding per depth level, in px. */
+const ROW_INDENT_STEP = 12
+
+/**
+ * Left padding of a change-tree row. Group, folder and file rows all use it, and
+ * all reserve the chevron slot, so a child sits exactly one step right of its parent.
+ * @param depth - indent depth.
+ * @returns the padding in px.
+ */
+function indentOf(depth: number): number {
+  return ROW_INDENT_BASE + depth * ROW_INDENT_STEP
+}
 
 const STATUS_TONES: Record<FileChangeEntry['status'] | 'U', TagTone> = {
   M: 'info',
@@ -98,7 +113,9 @@ export function CommitPanel(props: CommitPanelProps): ReactNode {
   const waitTip = t('busy.wait', { phase: phase?.text ?? '' })
   const anyCollapsed = state.collapsedNodes.length > 0
   const kind = state.busy?.kind
-  const canCommit = selectedCount > 0 && !busy && (state.message.trim() !== '' || state.amend)
+  // An empty box commits as the current-time stamp, so only a selection and an idle page gate it.
+  const canCommit = selectedCount > 0 && !busy
+  const stamp = useCommitStamp()
 
   const twisty = (open: boolean): ReactNode => (
     <span className="git-twistyGlyph" data-open={open}>
@@ -121,7 +138,8 @@ export function CommitPanel(props: CommitPanelProps): ReactNode {
     if (node.type === 'file') {
       const selected = state.selected?.path === node.path
       return (
-        <div key={`f:${node.path}`} className="git-row" data-selected={selected} style={{ paddingLeft: `${10 + depth * 12}px` }}>
+        <div key={`f:${node.path}`} className="git-row" data-selected={selected} style={{ paddingLeft: `${indentOf(depth)}px` }}>
+          <span className="git-twistySpacer" aria-hidden="true" />
           {tip(
             busy ? waitTip : t('file.check.tip', { name: node.name }),
             <TriCheckbox state={node.check} aria-label={node.name} disabled={busy} onChange={() => { store.actions.toggleFile(node) }} />,
@@ -132,6 +150,7 @@ export function CommitPanel(props: CommitPanelProps): ReactNode {
             <button
               type="button"
               className="git-fileBtn"
+              data-git-path={node.path}
               onClick={() => { void store.actions.openFile({ repoId: repoId ?? ROOT_REPO_ID, path: node.path, origPath: node.origPath, status: node.status }) }}
             >
               <FileTypeIcon path={node.path} size={14} />
@@ -146,7 +165,7 @@ export function CommitPanel(props: CommitPanelProps): ReactNode {
     const expanded = !state.collapsedNodes.includes(dirKey)
     return (
       <div key={`d:${dirKey}`}>
-        <div className="git-row" style={{ paddingLeft: `${6 + depth * 12}px` }}>
+        <div className="git-row" style={{ paddingLeft: `${indentOf(depth)}px` }}>
           {tip(
             expanded ? t('dir.open.tip', { name: node.name }) : t('dir.close.tip', { name: node.name }),
             <button type="button" className="git-twisty" aria-expanded={expanded} onClick={() => { store.actions.toggleDir(dirKey) }}>
@@ -169,7 +188,8 @@ export function CommitPanel(props: CommitPanelProps): ReactNode {
 
   const renderGroup = (group: GroupNode, labelKey: DshIntellijGitKey): ReactNode => (
     <div key={group.key}>
-      <div className="git-row git-rowGroup" style={{ paddingLeft: '6px' }}>
+      <div className="git-row git-rowGroup" style={{ paddingLeft: `${indentOf(0)}px` }}>
+        <span className="git-twistySpacer" aria-hidden="true" />
         {tip(
           busy ? waitTip : t('section.check.tip', { name: t(labelKey) }),
           <TriCheckbox state={group.check} aria-label={t(labelKey)} disabled={busy} onChange={() => { store.actions.toggleGroup(group) }} />,
@@ -278,7 +298,7 @@ export function CommitPanel(props: CommitPanelProps): ReactNode {
         />
       </div>
 
-      <div className="git-tree">
+      <div className="git-tree" tabIndex={-1}>
         {state.treeLoading && tree === null ? <div className="git-empty">{t('state.loading')}</div> : null}
         {state.treeError !== null ? <div className="git-empty">{state.treeError}</div> : null}
         {tree !== null && !tree.configured ? (
@@ -365,7 +385,7 @@ export function CommitPanel(props: CommitPanelProps): ReactNode {
             className="git-message"
             value={state.message}
             readOnly={busy}
-            placeholder={t('commit.messagePlaceholder')}
+            placeholder={t('commit.messagePlaceholder', { stamp })}
             aria-label={t('commit.message')}
             onChange={event => { store.actions.setMessage(event.target.value) }}
           />,

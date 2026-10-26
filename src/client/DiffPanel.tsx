@@ -45,6 +45,10 @@ import { WORD_DIFF_MAX_PAIRS, wordDiff, type CharRange } from './word-diff.ts'
 export interface DiffPanelProps {
   readonly store: IntellijGitStore
   readonly t: Translate
+  /** Narrow sheet: always unified, wrap starts on and is local, the mode control is hidden. */
+  readonly compact?: boolean
+  /** Renders a leading Back button that calls this (the narrow sheet's way out). */
+  readonly onClose?: () => void
 }
 
 /** Syntax highlighting is skipped above this many changed lines. */
@@ -181,9 +185,15 @@ function lineContent(text: string, spans: readonly HighlightSpan[] | undefined, 
  * @returns the panel.
  */
 export function DiffPanel(props: DiffPanelProps): ReactNode {
-  const { store, t } = props
+  const { store, t, onClose } = props
+  const compact = props.compact === true
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot)
   const phase = usePhase(t, state.busy)
+  // A phone view must not overwrite the desktop `wrap` / `viewMode` prefs, so the
+  // sheet keeps its own wrap state and renders unified whatever the pref says.
+  const [sheetWrap, setSheetWrap] = useState(true)
+  const viewMode = compact ? 'unified' : state.viewMode
+  const wrapLines = compact ? sheetWrap : state.wrapLines
   const [activeHunk, setActiveHunk] = useState(0)
   const [folds, setFolds] = useState<{ readonly key: string, readonly ids: ReadonlySet<string> }>({ key: '', ids: new Set() })
   const prefix = useId()
@@ -311,7 +321,7 @@ export function DiffPanel(props: DiffPanelProps): ReactNode {
     setFolds({ key: fileKey, ids: new Set([...expanded, id]) })
   }
 
-  const columns = state.viewMode === 'split' ? 4 : 3
+  const columns = viewMode === 'split' ? 4 : 3
 
   const hunkHeader = (hunk: DiffHunk, index: number): ReactNode => {
     const included = includedKeys.has(hunk.contentKey)
@@ -415,6 +425,17 @@ export function DiffPanel(props: DiffPanelProps): ReactNode {
   return (
     <div className="git-panel" data-dsh-git="diff">
       <div className="git-diffHead">
+        {onClose === undefined ? null : (
+          <ActionButton
+            tip={t('diff.sheet.back.tip')}
+            disabledTip={waitTip}
+            disabled={busy}
+            marker="sheet-back"
+            label={t('diff.sheet.back')}
+            icon={<IconChevronLeftOutlineRegular size={14} />}
+            onClick={onClose}
+          />
+        )}
         <ActionButton
           tip={t('diff.toolbar.previous.tip')}
           disabled={hunks.length === 0}
@@ -449,22 +470,24 @@ export function DiffPanel(props: DiffPanelProps): ReactNode {
           <span className="git-running"><StateDot state="ongoing" size={12} /><TextShimmer active>{phase?.label ?? ''}</TextShimmer></span>
         ) : null}
         <span className="git-grow" />
-        <SegmentedControl
-          id={`${prefix}-mode`}
-          value={state.viewMode}
-          label={t('diff.toolbar.mode')}
-          options={[
-            { value: 'split', label: t('diff.toolbar.split'), title: t('diff.toolbar.split.tip') },
-            { value: 'unified', label: t('diff.toolbar.unified'), title: t('diff.toolbar.unified.tip') },
-          ]}
-          onChange={mode => { store.actions.setViewMode(mode) }}
-        />
+        {compact ? null : (
+          <SegmentedControl
+            id={`${prefix}-mode`}
+            value={state.viewMode}
+            label={t('diff.toolbar.mode')}
+            options={[
+              { value: 'split', label: t('diff.toolbar.split'), title: t('diff.toolbar.split.tip') },
+              { value: 'unified', label: t('diff.toolbar.unified'), title: t('diff.toolbar.unified.tip') },
+            ]}
+            onChange={mode => { store.actions.setViewMode(mode) }}
+          />
+        )}
         <ActionButton
-          variant={state.wrapLines ? 'outline' : 'toolbar'}
+          variant={wrapLines ? 'outline' : 'toolbar'}
           tip={t('diff.toolbar.wrap.tip')}
           ariaLabel={t('diff.toolbar.wrap')}
           icon={<IconWrapLinesOutlineRegular size={14} />}
-          onClick={() => { store.actions.toggleWrap() }}
+          onClick={() => { if (compact) setSheetWrap(current => !current); else store.actions.toggleWrap() }}
         />
         <ActionButton
           variant={state.collapseUnchanged ? 'outline' : 'toolbar'}
@@ -498,7 +521,7 @@ export function DiffPanel(props: DiffPanelProps): ReactNode {
         </Tooltip>
       </div>
 
-      <div className="git-diffBody" data-wrap={state.wrapLines} style={{ '--git-cols': columns } as CSSProperties}>
+      <div className="git-diffBody" data-wrap={wrapLines} style={{ '--git-cols': columns } as CSSProperties}>
         {state.diffError !== null ? <div className="git-inlineError" role="alert"><span>{state.diffError}</span></div> : null}
         {diff === null && state.diffError === null ? (
           <div className="git-diffSkeleton" aria-busy="true" aria-label={t('state.loading')}>
@@ -510,9 +533,9 @@ export function DiffPanel(props: DiffPanelProps): ReactNode {
         {diff !== null && diff.binary ? <div className="git-empty">{t('diff.binary')}</div> : null}
         {diff !== null && !diff.binary && hunks.length === 0 ? <div className="git-empty">{t('state.noChanges')}</div> : null}
         {diff !== null && !diff.binary && hunks.length > 0 ? (
-          <table className="git-table" data-mode={state.viewMode}>
+          <table className="git-table" data-mode={viewMode}>
             <tbody>
-              {hunks.map((hunk, index) => (state.viewMode === 'split' ? renderSplit(hunk, index) : renderUnified(hunk, index)))}
+              {hunks.map((hunk, index) => (viewMode === 'split' ? renderSplit(hunk, index) : renderUnified(hunk, index)))}
             </tbody>
           </table>
         ) : null}

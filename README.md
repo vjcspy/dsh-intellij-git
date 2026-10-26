@@ -26,6 +26,23 @@ The plugin adds one row, **Git**, to the left sidebar panel list (directly under
 
 Colours come only from the platform's `--dsw-alias-*` design tokens, so the page follows the active theme.
 
+## Default commit message
+
+An empty commit message box commits as the browser's local time, `YYMMDD-HHMM` (for example `261026-2330`). The
+placeholder shows the live value and refreshes each minute; the value is resolved when the confirm dialog opens, shown
+in it ("empty box, current time"), and sent exactly as shown, so a dialog left open across a minute boundary still
+commits what it displays. Commit and Commit and Push are enabled whenever at least one change is ticked. Typing
+replaces the default; ticking Amend on an empty box still prefills the last commit message. The host contract is
+unchanged: a raw `repo/commit` with an empty message still answers `400 EMPTY_MESSAGE`.
+
+## Narrow pages
+
+Below 760px of page width (a phone, or a narrow main area) the page switches layout. The change list fills the body, the
+activity dock starts collapsed (a memory-only state: the desktop `dockOpen` preference is never written), and tapping a
+file opens its diff as an in-page full-screen sheet, always unified with wrapping on by default. `Changes` in the sheet's
+toolbar closes it. While the sheet is open the covered page is `inert`, focus moves to `Changes` and returns to the
+tapped file on exit. Desktop layout is unchanged.
+
 ## The branch dialog
 
 Clicking the branch badge opens an IntelliJ-style **Branches** dialog: a filter box, a `Local` group with the current

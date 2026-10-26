@@ -40,7 +40,6 @@ const CSS = `
 .git-danger { --dsw-alias-button-primary-fill: var(--dsw-alias-state-error-primary); }
 
 /* Page */
-[data-dsh-git='page'] { container-type: inline-size; container-name: dsh-git-page; }
 [data-dsh-git] .git-head {
   position: relative; flex: none; padding: 8px 12px 10px;
   background: var(--dsw-alias-bg-layer-1); border-bottom: 1px solid var(--dsw-alias-border-l1);
@@ -106,11 +105,13 @@ const CSS = `
 [data-dsh-git] .git-splitter[data-orientation='horizontal']:hover::after,
 [data-dsh-git] .git-splitter[data-orientation='horizontal']:focus-visible::after { height: 2px; }
 
-@container dsh-git-page (max-width: 760px) {
-  [data-dsh-git] .git-main { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
-  [data-dsh-git] .git-splitCol { display: none; }
-  [data-dsh-git] .git-colDiff { border-top: 1px solid var(--dsw-alias-border-l1); }
+/* Narrow page (the page measures itself and sets data-layout): the list fills the body and the diff is the sheet. */
+[data-dsh-git][data-layout='narrow'] .git-main { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+[data-dsh-git] .git-diffSheet {
+  position: absolute; inset: 0; z-index: 5; display: flex; flex-direction: column; min-height: 0;
+  background: var(--dsw-alias-bg-base);
 }
+[data-dsh-git] .git-diffSheet:focus, [data-dsh-git] .git-tree:focus { outline: none; }
 
 /* Toolbar and tree */
 [data-dsh-git] .git-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; padding: 8px 10px 6px; flex: none; }
@@ -139,6 +140,7 @@ const CSS = `
 }
 [data-dsh-git] .git-twisty:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-active); }
 [data-dsh-git] .git-twisty:disabled { opacity: 0.45; cursor: default; }
+[data-dsh-git] .git-twistySpacer { flex: none; width: 18px; height: 18px; }
 [data-dsh-git] .git-twistyGlyph { display: inline-flex; transition: transform 120ms ease; }
 [data-dsh-git] .git-check { margin: 0; flex: none; accent-color: var(--dsw-alias-brand-primary); }
 [data-dsh-git] .git-check:disabled { opacity: 0.5; }

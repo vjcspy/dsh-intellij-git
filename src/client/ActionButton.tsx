@@ -24,6 +24,8 @@ export interface ActionButtonProps {
   /** Phase label shown (with a spinner) while this control owns the running write. */
   readonly running?: string | null
   readonly danger?: boolean
+  /** Value of `data-git-marker`, for code that must find this control again. */
+  readonly marker?: string
   readonly onClick: () => void
 }
 
@@ -44,6 +46,7 @@ export function ActionButton(props: ActionButtonProps): ReactNode {
       disabled={disabled}
       aria-label={props.label === undefined ? props.ariaLabel : undefined}
       aria-busy={running ? true : undefined}
+      data-git-marker={props.marker}
       className={props.danger === true ? 'git-danger' : undefined}
       onClick={props.onClick}
     >

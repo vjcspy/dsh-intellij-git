@@ -25,6 +25,17 @@ export type ConfirmDialogProps = PropsLocale<'dshIntellijGit'> & {
 }
 
 /**
+ * The first line of a message, with an ellipsis when more lines follow.
+ * @param message - the full message.
+ * @returns the one-line form.
+ */
+function firstLineOf(message: string): string {
+  const lines = message.trim().split('\n')
+  const first = lines[0] ?? ''
+  return lines.length > 1 ? `${first}...` : first
+}
+
+/**
  * Render the confirmation for the pending write, when this pane owns it.
  * @param props - store, locale seat and the owning pane.
  * @returns the dialog, or null when there is nothing to confirm here.
@@ -54,6 +65,7 @@ export function ConfirmDialog(props: ConfirmDialogProps): ReactNode {
     body = (
       <div className="git-confirmBody">
         <p>{t(key, { files: files.length, branch, hunks })}</p>
+        <p className="git-mono">{t(pending.stamped ? 'confirm.commit.messageStamp' : 'confirm.commit.message', { message: firstLineOf(pending.message) })}</p>
         {state.amend ? <p className="git-warn">{t('confirm.commit.amend')}</p> : null}
         <p>
           {pending.push

@@ -35,6 +35,7 @@ import {
   type WorkspaceTreeResponse,
 } from '../config.ts'
 import { ApiError, createApi } from './api.ts'
+import { formatCommitStamp } from './commit-stamp.ts'
 import { readPref, writePref } from './layout-prefs.ts'
 import { buildGroups, dirKeysOf, filesOf, type DirNode, type GroupNode, type FileNode } from './tree-builder.ts'
 import type { DshIntellijGitKey } from './locale.ts'
@@ -66,7 +67,15 @@ export interface SelectedFile {
 
 /** The write the Human has been asked to confirm, and the pane that asked. */
 export type PendingAction =
-  | { readonly kind: 'commit', readonly origin: 'commit', readonly push: boolean }
+  | {
+    readonly kind: 'commit'
+    readonly origin: 'commit'
+    readonly push: boolean
+    /** The message the commit will carry, frozen when the dialog opened. */
+    readonly message: string
+    /** True when the box was empty and `message` is the current-time default. */
+    readonly stamped: boolean
+  }
   | { readonly kind: 'rollback', readonly origin: 'commit' }
   | { readonly kind: 'revertHunk', readonly origin: 'diff', readonly contentKey: string, readonly path: string }
   | { readonly kind: 'push', readonly origin: 'commit' }
@@ -185,6 +194,10 @@ export interface IntellijGitState {
   /** True when entries older than the first retained one were evicted or cleared. */
   readonly activityTruncated: boolean
   readonly activityOpen: boolean
+  /** Page width is below the narrow threshold; set by the page's `ResizeObserver`. */
+  readonly narrow: boolean
+  /** Dock state on a narrow page; memory-only, so the shared `dockOpen` pref is never touched. */
+  readonly activityOpenNarrow: boolean
   /** Ids of the entries whose captured output is expanded. */
   readonly activityDetail: readonly number[]
   /** Keys of the request groups whose git calls are expanded. */
@@ -232,6 +245,10 @@ export interface IntellijGitActions {
    */
   setPageActive(active: boolean): void
   openFile(file: SelectedFile): Promise<void>
+  /** Deselect the file and drop its diff (the narrow sheet's Back); supersedes an in-flight load. */
+  closeDiff(): void
+  /** Record whether the page is narrow; a no-op when unchanged. */
+  setNarrow(narrow: boolean): void
   refreshDiff(): Promise<void>
   setViewMode(mode: 'split' | 'unified'): void
   toggleCollapse(): void
@@ -299,6 +316,16 @@ type DiffOutcome =
   | { readonly kind: 'superseded' }
 
 /**
+ * Whether the activity dock is open for the current layout: the persisted
+ * preference on a wide page, the memory-only flag on a narrow one.
+ * @param state - current state.
+ * @returns true when the dock body shows.
+ */
+export function dockOpenOf(state: Pick<IntellijGitState, 'narrow' | 'activityOpen' | 'activityOpenNarrow'>): boolean {
+  return state.narrow ? state.activityOpenNarrow : state.activityOpen
+}
+
+/**
  * Whether reverting this entry deletes the file from disk.
  *
  * Mirrors the host's own predicate, so the dialog can never say "nothing is
@@ -357,6 +384,8 @@ export function createIntellijGitStore(): IntellijGitStore {
     activityLastSeenId: 0,
     activityTruncated: false,
     activityOpen: readPref('dockOpen', true),
+    narrow: false,
+    activityOpenNarrow: false,
     activityDetail: [],
     activityGroupsOpen: [],
     showBackground: readPref('showBackground', false),
@@ -629,7 +658,7 @@ export function createIntellijGitStore(): IntellijGitStore {
         activityLastSeenId: response.latestId,
         activityTruncated: truncated,
         activityStale: false,
-        ...(grew && !state.activityOpen ? { activityUnread: true } : {}),
+        ...(grew && !dockOpenOf(state) ? { activityUnread: true } : {}),
       })
     } catch {
       if (generation === activityGeneration) set({ activityStale: true })
@@ -1109,6 +1138,17 @@ export function createIntellijGitStore(): IntellijGitStore {
       await loadDiff(file)
     },
 
+    closeDiff() {
+      if (state.busy !== null || state.pending !== null) return
+      diffRequestSeq += 1
+      set({ selected: null, diff: null, diffError: null, diffLoading: false })
+    },
+
+    setNarrow(narrow) {
+      if (state.narrow === narrow) return
+      set({ narrow })
+    },
+
     async refreshDiff() {
       const selected = state.selected
       if (selected === null) return
@@ -1228,7 +1268,11 @@ export function createIntellijGitStore(): IntellijGitStore {
 
     requestCommit(push) {
       if (state.busy !== null || state.pending !== null) return
-      set({ pending: { kind: 'commit', origin: 'commit', push }, banner: null, toast: null })
+      // Resolved once, here: the dialog shows this value and `confirmPending`
+      // sends it, so what the Human confirms is what git records.
+      const stamped = state.message.trim() === ''
+      const message = stamped ? formatCommitStamp(new Date()) : state.message
+      set({ pending: { kind: 'commit', origin: 'commit', push, message, stamped }, banner: null, toast: null })
     },
 
     requestPush() {
@@ -1381,6 +1425,11 @@ export function createIntellijGitStore(): IntellijGitStore {
     },
 
     toggleActivity() {
+      if (state.narrow) {
+        const open = !state.activityOpenNarrow
+        set({ activityOpenNarrow: open, ...(open ? { activityUnread: false } : {}) })
+        return
+      }
       const open = !state.activityOpen
       writePref('dockOpen', open)
       set({ activityOpen: open, ...(open ? { activityUnread: false } : {}) })
@@ -1442,7 +1491,7 @@ export function createIntellijGitStore(): IntellijGitStore {
             repoId,
             expectedHeadOid: status.headOid,
             expectedBranch: status.detached ? null : status.branch,
-            message: state.message,
+            message: pending.message,
             amend: state.amend,
             files,
             push: pending.push,

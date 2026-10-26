@@ -25,7 +25,7 @@ import type { ActivityEntry } from '../config.ts'
 import { ActionButton } from './ActionButton.tsx'
 import { groupActivity, type ActivityGroup } from './activity-groups.ts'
 import type { Translate } from './locale.ts'
-import type { IntellijGitStore } from './store.ts'
+import { dockOpenOf, type IntellijGitStore } from './store.ts'
 
 /** Props: the shared store and the locale seat. */
 export interface ActivityDockProps {
@@ -155,17 +155,17 @@ export function ActivityDock(props: ActivityDockProps): ReactNode {
   const hidden = all.length - groups.length
 
   return (
-    <div className="git-dock" data-open={state.activityOpen}>
+    <div className="git-dock" data-open={dockOpenOf(state)}>
       <div className="git-dockHead">
         <Tooltip label={t('activity.toggle.tip')} delayMs={500} portal>
-          <button type="button" className="git-twisty" aria-expanded={state.activityOpen} aria-label={t('activity.title')} onClick={() => { store.actions.toggleActivity() }}>
-            <span className="git-twistyGlyph" data-open={state.activityOpen}>
-              {state.activityOpen ? <IconChevronDownOutlineRegular size={12} /> : <IconChevronRightOutlineRegular size={12} />}
+          <button type="button" className="git-twisty" aria-expanded={dockOpenOf(state)} aria-label={t('activity.title')} onClick={() => { store.actions.toggleActivity() }}>
+            <span className="git-twistyGlyph" data-open={dockOpenOf(state)}>
+              {dockOpenOf(state) ? <IconChevronDownOutlineRegular size={12} /> : <IconChevronRightOutlineRegular size={12} />}
             </span>
           </button>
         </Tooltip>
         <span className="git-label git-groupLabel">{t('activity.title')}</span>
-        {state.activityUnread && !state.activityOpen ? <span className="git-unread" role="status" aria-label={t('activity.unread')} /> : null}
+        {state.activityUnread && !dockOpenOf(state) ? <span className="git-unread" role="status" aria-label={t('activity.unread')} /> : null}
         <span className="git-count">{t('activity.summary', { requests: groups.length, entries: state.activity.length })}</span>
         {state.activityStale ? <span className="git-warn">{t('activity.stale')}</span> : null}
         {state.activityError === null ? null : <span className="git-warn" role="alert">{t('activity.clearFailed', { reason: state.activityError })}</span>}
@@ -194,7 +194,7 @@ export function ActivityDock(props: ActivityDockProps): ReactNode {
           onClick={() => { void store.actions.clearActivity() }}
         />
       </div>
-      {state.activityOpen ? (
+      {dockOpenOf(state) ? (
         <div className="git-dockBody" role="log" aria-label={t('activity.title')}>
           {groups.length === 0
             ? <div className="git-activityEmpty">{t('activity.empty')}</div>
